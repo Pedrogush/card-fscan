@@ -171,6 +171,16 @@ Expected outputs only contain ground truth; scoring is done by `tools/eval.py`:
 - **column count**: n_cards and stop_card must match exactly.
 - **status**: `retake` images must be reported as retake.
 
+Manifest extras (clarified, tools v1): slot `lang` may be `other` (a printing
+in a language outside the index; may be review/empty, excluded from the
+auto-rate denominator, but a wrong auto still counts as wrong); slots may carry
+`tags` (`split_sideways`, same treatment); a negative column (e.g. 19 cards, no
+stop card) carries `"expect_column_status": "error"` and its n_cards is not
+scored; `scryfall_id`, `image_uri`, `category`, `placement` are generator data,
+not truth. An `auto` slot where no card lies (slot > n_cards) counts as wrong.
+See `eval_notes` in each manifest.
+
 Each implementation provides a desktop CLI
-`scan --out <dir> <image>...` that writes `<dir>/<image basename>.json`, and
+`scan --out <dir> <image>...` that writes `<dir>/<image basename>.json`
+(eval accepts both `c4_0001.json` and `c4_0001.jpg.json`), and
 `tools/eval.py --manifest testdata/smoke/manifest.json --results <dir>` scores it.
