@@ -35,22 +35,41 @@ from reference_match import normalize  # noqa: E402
 ROOT = TOOLS.parent
 CACHE = ROOT / "testdata" / "cache" / "scryfall"
 NAMES = ROOT / "testdata" / "names" / "names_v1.json"
-POOL_PATH = CACHE / "pool_v1.json"
 USER_AGENT = "card-fscan-synthgen/0.1 (+https://github.com/Pedrogush/card-fscan)"
 API_DELAY_S = 0.12
 POOL_SEED = 20261005
 
-# Number of distinct printings per pool category. Cards are reused across
-# images; this bounds the download to ~1,600 images (~250 MB).
-POOL_QUOTA = {
-    "en_old": 220,        # frame 1993 / 1997
-    "en_modern": 520,     # frame 2003 / 2015, regular border
-    "en_special": 140,    # borderless, showcase, extended art
-    "en_multiface": 160,  # adventure, transform, modal_dfc, flip, aftermath
-    "en_split": 25,       # sideways split cards (tricky: name not on top edge)
-    "pt": 500,
-    "other": 90,          # ja/de/fr/es/it/ru/ko/zhs printings
+# Pool versions. A manifest stores every slot's printing and image URL, so
+# --regen never needs the pool; the version only matters when planning a new
+# set (smoke/dev were planned with v1, large with v2). Quotas are distinct
+# printings per category; cards are reused across images.
+POOL_VERSIONS: dict[int, dict[str, Any]] = {
+    1: {
+        "quota": {
+            "en_old": 220,        # frame 1993 / 1997
+            "en_modern": 520,     # frame 2003 / 2015, regular border
+            "en_special": 140,    # borderless, showcase, extended art
+            "en_multiface": 160,  # adventure, transform, modal_dfc, flip, aftermath
+            "en_split": 25,       # sideways split cards (tricky: name not on top edge)
+            "pt": 500,
+            "other": 90,          # ja/de/fr/es/it/ru/ko/zhs printings
+        },
+        "other_pages": None,      # v1: first 2 pages (order=set) per language
+    },
+    2: {
+        "quota": {
+            "en_old": 1000, "en_modern": 2100, "en_special": 650, "en_multiface": 650, "en_split": 80,
+            "pt": 1600, "other": 480,
+        },
+        "other_pages": 9,         # v2: 9 random result pages per language (many sets)
+    },
 }
+
+
+def pool_path(version: int) -> Path:
+    return CACHE / f"pool_v{version}.json"
+
+
 OTHER_LANGS = ["de", "fr", "es", "it", "ja", "ru", "ko", "zhs"]
 EXCLUDED_LAYOUTS = {
     "token", "double_faced_token", "emblem", "art_series", "planar", "scheme",
@@ -118,6 +137,11 @@ class Scryfall:
             if max_pages is not None and pages >= max_pages:
                 return
             url = doc.get("next_page") if doc.get("has_more") else None
+
+    def search_page(self, q: str, page: int) -> dict[str, Any]:
+        url = "https://api.scryfall.com/cards/search?" + urllib.parse.urlencode(
+            {"q": q, "unique": "prints", "order": "set", "include_extras": "false", "page": page})
+        return self.api_json(url)
 
     def bulk_jsonl(self, kind: str) -> Path:
         """Download (once) a Scryfall bulk file as .jsonl.gz and return its path."""
@@ -250,6 +274,7 @@ def _record(card: dict[str, Any], cat: str, lang: str, name: str, img: str) -> d
         "oracle_id": card["oracle_id"],
         "name": name,
         "lang": lang,
+        "printed_lang": card.get("lang"),
         "set": card.get("set"),
         "collector_number": card.get("collector_number"),
         "frame": card.get("frame"),
@@ -259,15 +284,18 @@ def _record(card: dict[str, Any], cat: str, lang: str, name: str, img: str) -> d
     }
 
 
-def build_pool(sf: Scryfall) -> dict[str, list[dict[str, Any]]]:
-    if POOL_PATH.exists():
-        return json.loads(POOL_PATH.read_text(encoding="utf-8"))
+def build_pool(sf: Scryfall, version: int = 2) -> dict[str, list[dict[str, Any]]]:
+    path = pool_path(version)
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    quota_map: dict[str, int] = POOL_VERSIONS[version]["quota"]
+    other_pages: int | None = POOL_VERSIONS[version]["other_pages"]
     keys = _load_name_keys()
 
     def solvable(name: str, oracle_id: str) -> bool:
         return keys.get(normalize(name)) == {oracle_id}
 
-    cands: dict[str, list[dict[str, Any]]] = {c: [] for c in POOL_QUOTA}
+    cands: dict[str, list[dict[str, Any]]] = {c: [] for c in quota_map}
     # EN from unique_artwork
     with gzip.open(sf.bulk_jsonl("unique_artwork"), "rt", encoding="utf-8") as f:
         for line in f:
@@ -293,9 +321,17 @@ def build_pool(sf: Scryfall) -> dict[str, list[dict[str, Any]]]:
             continue
         if img and solvable(name, card["oracle_id"]):
             cands["pt"].append(_record(card, "pt", "pt", name, img))
-    # other languages: two pages each
+    # other languages
+    page_rng = np.random.default_rng([POOL_SEED, 7])
     for lg in OTHER_LANGS:
-        for card in sf.search(f"lang:{lg}", max_pages=2):
+        if other_pages is None:
+            cards: Iterator[dict[str, Any]] | list[dict[str, Any]] = sf.search(f"lang:{lg}", max_pages=2)
+        else:
+            first = sf.search_page(f"lang:{lg}", 1)
+            n_pages = max(1, -(-int(first.get("total_cards", 0)) // 175))
+            pages = sorted(int(p) + 1 for p in page_rng.permutation(n_pages)[:other_pages])
+            cards = [c for pg in pages for c in sf.search_page(f"lang:{lg}", pg).get("data", [])]
+        for card in cards:
             if not _eligible(card, allow_lowres=True) or card.get("layout") == "split":
                 continue
             name, img = _visible(card, lg)
@@ -304,7 +340,7 @@ def build_pool(sf: Scryfall) -> dict[str, list[dict[str, Any]]]:
 
     rng = np.random.default_rng(POOL_SEED)
     pool: dict[str, list[dict[str, Any]]] = {}
-    for cat, quota in POOL_QUOTA.items():
+    for cat, quota in quota_map.items():
         items = sorted(cands[cat], key=lambda r: r["scryfall_id"])
         if cat in ("pt", "other"):
             # one printing per oracle_id keeps the pool diverse
@@ -329,5 +365,10 @@ def build_pool(sf: Scryfall) -> dict[str, list[dict[str, Any]]]:
             idx = order[:quota]
         pool[cat] = [items[int(i)] for i in sorted(idx)]
         print(f"pool {cat}: {len(pool[cat])} of {len(cands[cat])} candidates", file=sys.stderr)
-    POOL_PATH.write_text(json.dumps(pool, ensure_ascii=False, indent=0), encoding="utf-8")
+    if version == 1:
+        # v1 records predate the printed_lang field
+        for recs in pool.values():
+            for r in recs:
+                r.pop("printed_lang", None)
+    path.write_text(json.dumps(pool, ensure_ascii=False, indent=0), encoding="utf-8")
     return pool

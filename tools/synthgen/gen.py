@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import multiprocessing as mp
+import os
 import sys
 import time
 from pathlib import Path
@@ -162,6 +163,8 @@ def plan_image(recipe: dict[str, Any], seed: int, pool: dict[str, list[dict[str,
                     "category": cat, "scryfall_id": card["scryfall_id"], "image_uri": card["image_uri"]}
             if cat == "en_split":
                 slot["tags"] = ["split_sideways"]
+            if card.get("printed_lang") and cat == "other":
+                slot["printed_lang"] = card["printed_lang"]
             slots.append(slot)
         col: dict[str, Any] = {"column": j, "stop_card": stops[j - 1], "n_cards": counts[j - 1], "slots": slots}
         if negative and negative["kind"] == "wrong_count" and negative["column"] == j:
@@ -478,8 +481,24 @@ def debug_crops(entry: dict[str, Any], jpeg: bytes, found: dict[int, np.ndarray]
 # Driver
 
 
+def lower_priority() -> None:
+    """Run below normal priority so concurrent benchmarks get clean timing."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+            k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            k32.SetPriorityClass(k32.GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            os.nice(5)
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"(could not lower priority: {exc})", file=sys.stderr)
+
+
 def _work(args: tuple[str, dict[str, Any], str, bool, bool]) -> tuple[str, dict[str, Any], str, int]:
     key, entry, set_dir, regen, debug = args
+    lower_priority()
     cv2.setNumThreads(1)
     sf = Scryfall()
     stem = Path(key).stem
@@ -517,6 +536,8 @@ def write_readme(set_dir: Path, set_name: str, manifest: dict[str, Any]) -> None
     langs: dict[str, int] = {}
     partial = retake = wrong = 0
     slots = 0
+    printings: set[str] = set()
+    oracles: set[str] = set()
     for e in imgs.values():
         by_cfg[e["config"]] = by_cfg.get(e["config"], 0) + 1
         by_lv[e["level"]] = by_lv.get(e["level"], 0) + 1
@@ -526,6 +547,8 @@ def write_readme(set_dir: Path, set_name: str, manifest: dict[str, Any]) -> None
         for c in e["columns"]:
             for s in c["slots"]:
                 slots += 1
+                printings.add(s["scryfall_id"])
+                oracles.add(s["oracle_id"])
                 langs[s["lang"]] = langs.get(s["lang"], 0) + 1
     seed = manifest.get("seed")
     text = f"""# testdata/{set_name}
@@ -541,11 +564,12 @@ uv run --project tools tools/synthgen/gen.py --set {set_name} --regen
 That downloads the card images once into `testdata/cache/` (gitignored) and
 rebuilds every image bit-for-bit from the per-image seeds in the manifest (same
 machine and pinned library versions). The set was created with
-`gen.py --set {set_name} --n {n} --seed {seed}`.
+`gen.py --set {set_name} --n {n} --seed {seed}` (card pool {manifest.get("pool", "v1")}).
 
 Contents: {n} images ({', '.join(f'{v} {k}' for k, v in sorted(by_cfg.items()))};
 {', '.join(f'{v} {k}' for k, v in sorted(by_lv.items()))}), {slots} true card slots
-({', '.join(f'{k} {v} ({100 * v / max(1, slots):.0f}%)' for k, v in sorted(langs.items()))}).
+({', '.join(f'{k} {v} ({100 * v / max(1, slots):.0f}%)' for k, v in sorted(langs.items()))});
+{len(printings)} distinct printings, {len(oracles)} distinct oracle_ids.
 {partial} images with stop cards (partial columns), {retake} retake images (a marker
 hidden), {wrong} images with a 19-card column without stop card (column must be `error`).
 
@@ -570,16 +594,28 @@ def main() -> None:
     ap.add_argument("--debug", nargs="*", default=None,
                     help="write slot crops for these stems (no args: all) to testdata/<set>/_debug")
     ap.add_argument("--workers", type=int, default=1, help="render processes (<= 2 recommended)")
+    ap.add_argument("--pool", type=int, default=2, help="card pool version for planning new sets (smoke/dev: 1)")
     args = ap.parse_args()
-
+    lower_priority()
     set_dir = TESTDATA / args.set_name
     set_dir.mkdir(parents=True, exist_ok=True)
+    marker = set_dir / ".generating"
+    marker.write_text(f"pid {os.getpid()} started {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
+    try:
+        _main(args, set_dir)
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def _main(args: argparse.Namespace, set_dir: Path) -> None:
+
     man_path = set_dir / "manifest.json"
+    partial_path = set_dir / "manifest.partial.json"
     sf = Scryfall()
     if args.regen:
         manifest = json.loads(man_path.read_text(encoding="utf-8"))
     else:
-        pool = build_pool(sf)
+        pool = build_pool(sf, args.pool)
         rng = np.random.default_rng(args.seed)
         recipes = plan_recipes(args.set_name, args.n, rng)
         images: dict[str, Any] = {}
@@ -589,6 +625,7 @@ def main() -> None:
             images[key] = plan_image(rec, seed, pool)
         manifest = {
             "spec_version": 1, "set": args.set_name, "generator": GENERATOR, "seed": args.seed,
+            "pool": f"v{args.pool}",
             "card_images": "Scryfall 'large' JPEG (672x936, ~10.7 px/mm); card art (c) Wizards of the Coast",
             "eval_notes": EVAL_NOTES, "images": images,
         }
@@ -603,24 +640,45 @@ def main() -> None:
     print(f"{len(urls)} card images ready ({time.time() - t0:.0f}s)", flush=True)
 
     keys = list(manifest["images"])
+    # resume an interrupted generation: reuse finished entries whose image exists
+    resumed: dict[str, Any] = {}
+    if not args.regen and partial_path.exists():
+        part = json.loads(partial_path.read_text(encoding="utf-8"))
+        if part.get("seed") == args.seed and set(part["images"]) == set(manifest["images"]):
+            for k, e in part["images"].items():
+                if "difficulty" in e and (set_dir / Path(k).name).exists():
+                    resumed[k] = e
+            print(f"resuming: {len(resumed)} images already done", flush=True)
+    for k, e in resumed.items():
+        manifest["images"][k] = e
+    keys = [k for k in keys if k not in resumed]
     if args.only:
         keys = [k for k in keys if Path(k).stem in args.only]
     debug_all = args.debug is not None and len(args.debug) == 0
     jobs = [(k, manifest["images"][k], str(set_dir), args.regen,
              debug_all or (args.debug is not None and Path(k).stem in args.debug)) for k in keys]
     t0 = time.time()
+
+    def checkpoint(i: int, key: str, entry: dict[str, Any]) -> None:
+        if args.regen:
+            return
+        manifest["images"][key] = entry
+        if i % 5 == 0:
+            partial_path.write_text(json.dumps(manifest, ensure_ascii=False) + "\n", encoding="utf-8")
+
     if args.workers > 1:
         with mp.get_context("spawn").Pool(args.workers) as p:
-            results = p.imap(_work, jobs)
-            done = [_report(r, t0) for r in results]
+            for i, r in enumerate(p.imap(_work, jobs), start=1):
+                checkpoint(i, *_report(r, t0))
     else:
-        done = [_report(_work(j), t0) for j in jobs]
+        for i, j in enumerate(jobs, start=1):
+            checkpoint(i, *_report(_work(j), t0))
+    print(f"rendered {len(jobs)} images in {time.time() - t0:.0f}s", flush=True)
     if not args.regen:
-        for key, entry in done:
-            manifest["images"][key] = entry
         man_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n", encoding="utf-8",
                             newline="\n")
         write_readme(set_dir, args.set_name, manifest)
+        partial_path.unlink(missing_ok=True)
         print(f"wrote {man_path}")
 
 
