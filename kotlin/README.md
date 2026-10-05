@@ -99,7 +99,9 @@ and correct retake detection.
 | dev | 60 | 5,255 | **94.40%** (EN 93.4%, PT 97.3%) | **0** | 440 | 82 | 0 | 0 | 15,689 / 13,594 / 33,295 |
 
 "Scored" excludes `lang: other` printings and sideways split cards (see `eval_notes`).
-By difficulty on dev: easy 95.7%, normal 95.1%, hard 91.7%.
+By difficulty on dev: easy 95.7%, normal 95.1%, hard 91.7%. With `--preset located+` (two
+extra fallback crops) dev reaches 94.72% auto, still 0 wrong, at a mean of 19,054 ms per photo
+(+21% time). It is not the default.
 
 **Timing.** Measured on this laptop: an Intel i5-3330 (2012, 4 cores, AVX but no AVX2/FMA)
 shared with two other build agents, with ONNX Runtime limited to 2 threads. About 87% of the
