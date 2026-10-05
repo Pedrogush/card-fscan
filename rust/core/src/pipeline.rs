@@ -15,6 +15,7 @@ use crate::image_ops::{clahe, invert, warp_rect};
 use crate::matching::{MatchResult, MatchStatus, NameIndex};
 use crate::ocr::{OcrLine, Recognizer};
 use crate::output::*;
+use crate::profile::{Count, Profile, Stage, ms_since};
 
 /// Knobs of the pipeline (everything that is not fixed by the spec).
 #[derive(Debug, Clone)]
@@ -110,8 +111,9 @@ impl Scanner {
 
     /// SPEC §2.1-2.4: find the markers, decide the config, and work out each
     /// readable column's geometry and length.
-    pub fn locate(&self, photo: &GrayImage) -> Layout {
-        let markers = aruco::detect(photo, &self.params.detector);
+    pub fn locate(&self, photo: &GrayImage, prof: &Profile) -> Layout {
+        let markers = prof.time(Stage::Detect, || aruco::detect(photo, &self.params.detector));
+        let t_layout = Instant::now();
         // Card art occasionally decodes as a stray marker, so a header marker
         // is only trusted as part of a geometrically consistent pair, and the
         // C6 ids only count when they sit where a header marker should be.
@@ -141,6 +143,7 @@ impl Scanner {
                 }
             }
         }
+        prof.add(Stage::Layout, t_layout);
         layout
     }
 
@@ -152,7 +155,7 @@ impl Scanner {
     /// column. We therefore walk down each column and centre every slot's
     /// text search on the drift predicted from the name lines already found
     /// above it (see [`predict_shift`]). Slot numbering is unchanged.
-    pub fn crops(&self, photo: &GrayImage, layout: &Layout) -> Vec<SlotCrop> {
+    pub fn crops(&self, photo: &GrayImage, layout: &Layout, prof: &Profile) -> Vec<SlotCrop> {
         layout
             .columns
             .par_iter()
@@ -160,9 +163,9 @@ impl Scanner {
                 let mut offsets: Vec<f64> = Vec::with_capacity(c.n_cards);
                 (1..=c.n_cards)
                     .map(|i| {
-                        let shift_mm = predict_shift(&offsets);
+                        let shift_mm = prof.time(Stage::LineFind, || predict_shift(&offsets));
                         let (image, offset) = self
-                            .slot_crop(photo, &c.geometry, i, shift_mm, CropVariant::Primary)
+                            .slot_crop(photo, &c.geometry, i, shift_mm, CropVariant::Primary, prof)
                             .expect("primary crop always exists");
                         offsets.push(offset);
                         SlotCrop { column: c.geometry.column, slot: i, shift_mm, image }
@@ -175,14 +178,15 @@ impl Scanner {
     /// Scan one photo. `image_name` is copied into the result.
     pub fn scan(&self, photo: &GrayImage, image_name: &str) -> Result<PhotoResult, Error> {
         let t0 = Instant::now();
+        let prof = Profile::new();
         let mut timing = Timing::default();
 
-        let layout = self.locate(photo);
-        timing.detect = t0.elapsed().as_millis() as u64;
+        let layout = self.locate(photo, &prof);
+        timing.detect = ms_since(t0);
         let mut columns: Vec<ColumnResult> = layout.unreadable.iter().map(|&j| error_column(j)).collect();
 
         let t_crop = Instant::now();
-        let crops = self.crops(photo, &layout);
+        let crops = self.crops(photo, &layout, &prof);
         if let Some(dir) = &self.params.dump_dir {
             let stem = image_name.rsplit_once('.').map_or(image_name, |(s, _)| s);
             for c in &crops {
@@ -190,57 +194,61 @@ impl Scanner {
                 let _ = c.image.save(dir.join(format!("{stem}_c{}_s{:02}.png", c.column, c.slot)));
             }
         }
-        timing.crop = t_crop.elapsed().as_millis() as u64;
+        timing.crop = ms_since(t_crop);
 
         // SPEC §2.6-2.7, pass 1: OCR + match the crops as they are.
         let t_ocr = Instant::now();
         let images: Vec<GrayImage> = crops.iter().map(|c| c.image.clone()).collect();
-        let lines = self.recognizer.recognize(&images)?;
-        timing.ocr = t_ocr.elapsed().as_millis() as u64;
+        let lines = self.recognizer.recognize(&images, &prof)?;
+        timing.ocr = ms_since(t_ocr);
         let t_match = Instant::now();
-        let mut reads = self.match_all(lines);
-        timing.match_ = t_match.elapsed().as_millis() as u64;
+        let mut reads = self.match_all(lines, &prof);
+        timing.match_ = ms_since(t_match);
 
         // Pass 2: slots that didn't auto-accept get more attempts: the
         // inverted crop (white-on-dark name bars), the second-best text line
         // and the untrimmed line. The best-scoring match wins.
         let retry: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
         if !retry.is_empty() {
+            let t_retry = Instant::now();
+            prof.count(Count::RetrySlots, retry.len() as u64);
             let geometry_of =
                 |j: usize| &layout.columns.iter().find(|c| c.geometry.column == j).expect("crop of a known column").geometry;
             let mut variants = vec![CropVariant::SecondLine, CropVariant::Untrimmed];
             if self.params.try_inverted {
                 variants.push(CropVariant::Inverted);
             }
-            let t_crop = Instant::now();
             // (read index, crop) for every fallback crop that exists.
             let jobs: Vec<(usize, GrayImage)> = retry
                 .par_iter()
                 .flat_map_iter(|&k| {
                     let c = &crops[k];
                     let g = geometry_of(c.column);
-                    variants
-                        .iter()
-                        .filter_map(move |&v| self.slot_crop(photo, g, c.slot, c.shift_mm, v).map(|(img, _)| (k, img)))
+                    let prof = &prof;
+                    variants.iter().filter_map(move |&v| {
+                        self.slot_crop(photo, g, c.slot, c.shift_mm, v, prof).map(|(img, _)| (k, img))
+                    })
                 })
                 .collect();
-            timing.crop += t_crop.elapsed().as_millis() as u64;
+            prof.count(Count::RetryCrops, jobs.len() as u64);
             let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
             let t_ocr = Instant::now();
-            let lines = self.recognizer.recognize(&extra)?;
-            timing.ocr += t_ocr.elapsed().as_millis() as u64;
+            let lines = self.recognizer.recognize(&extra, &prof)?;
+            timing.ocr += ms_since(t_ocr);
             let t_match = Instant::now();
-            for (k, alt) in owners.into_iter().zip(self.match_all(lines)) {
+            for (k, alt) in owners.into_iter().zip(self.match_all(lines, &prof)) {
                 if alt.better_than(&reads[k]) {
                     reads[k] = alt;
                 }
             }
-            timing.match_ += t_match.elapsed().as_millis() as u64;
+            timing.match_ += ms_since(t_match);
+            timing.retry = ms_since(t_retry);
         }
 
         // Assemble the columns. `by_ref()` lets `take` consume from the shared
         // iterator without moving it, so each column continues where the
         // previous one stopped.
+        let n_slots = reads.len();
         let mut reads = reads.into_iter();
         for plan in &layout.columns {
             let (column, stop_card, n_cards) = (plan.geometry.column, plan.stop_card, plan.n_cards);
@@ -261,7 +269,10 @@ impl Scanner {
             });
         }
         columns.sort_by_key(|c| c.column);
-        timing.total = t0.elapsed().as_millis() as u64;
+        timing.scan = ms_since(t0);
+        timing.total = timing.scan;
+        timing.stages = prof.stage_times();
+        timing.counters = prof.counters(n_slots);
 
         Ok(PhotoResult {
             spec_version: SPEC_VERSION,
@@ -275,8 +286,8 @@ impl Scanner {
 
     /// Match OCR lines against the name index in parallel (rayon's
     /// `into_par_iter` spreads the work over all cores; `collect` keeps order).
-    fn match_all(&self, lines: Vec<OcrLine>) -> Vec<Read> {
-        lines.into_par_iter().map(|line| self.match_line(line)).collect()
+    fn match_all(&self, lines: Vec<OcrLine>, prof: &Profile) -> Vec<Read> {
+        lines.into_par_iter().map(|line| self.match_line(line, prof)).collect()
     }
 
     /// Match one OCR line. Mana costs read as letters (`Dig Through Time
@@ -287,10 +298,10 @@ impl Scanner {
     /// always a fragment (one glyph of a decorated name, a mana symbol), yet it
     /// can exactly match a 1-2 letter card name such as "X". Such slots are
     /// sent to review. This only ever makes the SPEC accept rule stricter.
-    fn match_line(&self, line: OcrLine) -> Read {
-        let mut m = self.index.match_raw(&line.text);
+    fn match_line(&self, line: OcrLine, prof: &Profile) -> Read {
+        let mut m = self.index.match_raw_profiled(&line.text, prof);
         if let Some(stripped) = strip_mana_token(&line.text) {
-            let alt = self.index.match_raw(stripped);
+            let alt = self.index.match_raw_profiled(stripped, prof);
             if alt.best_score() > m.best_score() {
                 m = alt;
             }
@@ -314,14 +325,15 @@ impl Scanner {
         i: usize,
         shift_mm: f64,
         variant: CropVariant,
+        prof: &Profile,
     ) -> Option<(GrayImage, f64)> {
         let nominal = geometry::slot_box_mm(i, self.params.slot_pad_mm);
         let band = Rect { y0: nominal.y0 + shift_mm, y1: nominal.y1 + shift_mm, ..nominal };
-        let mut crop = warp_rect(photo, &g.mm_to_img, band, PX_PER_MM);
+        let mut crop = prof.time(Stage::Warp, || warp_rect(photo, &g.mm_to_img, band, PX_PER_MM));
         let card_top = geometry::HEADER_Y + geometry::SLOT_PITCH * (i as f64 - 1.0);
         let mut offset = shift_mm;
         if let Some(h) = self.params.text_height_mm {
-            let lines = text_rows(&crop, band.y0, card_top + shift_mm, h);
+            let lines = prof.time(Stage::LineFind, || text_rows(&crop, band.y0, card_top + shift_mm, h));
             let line = match variant {
                 CropVariant::SecondLine => *lines.get(1)?,
                 _ => lines[0],
@@ -332,17 +344,19 @@ impl Scanner {
             return None;
         }
         if self.params.trim_right && variant != CropVariant::Untrimmed {
-            let x1 = text_right_end(&crop);
+            let x1 = prof.time(Stage::Trim, || text_right_end(&crop));
             crop = image::imageops::crop_imm(&crop, 0, 0, x1, crop.height()).to_image();
         } else if variant == CropVariant::Untrimmed && !self.params.trim_right {
             return None;
         }
+        let t = Instant::now();
         if let Some(clip) = self.params.clahe_clip {
             crop = clahe(&crop, self.params.clahe_tiles.0, self.params.clahe_tiles.1, clip);
         }
         if variant == CropVariant::Inverted {
             crop = invert(&crop);
         }
+        prof.add(Stage::Enhance, t);
         Some((crop, offset))
     }
 }
@@ -408,6 +422,17 @@ fn strip_mana_token(text: &str) -> Option<&str> {
         && last.chars().all(|c| c.is_ascii_digit() || "XWUBRGC{}".contains(c))
         && (last.chars().any(|c| c.is_ascii_digit()) || last.chars().all(|c| c.is_ascii_uppercase()));
     (manaish && !head.trim().is_empty()).then_some(head)
+}
+
+/// Decode a JPEG/PNG photo to 8-bit grayscale. Returns the image and the
+/// milliseconds spent decoding and converting to gray.
+pub fn decode_gray(bytes: &[u8]) -> Result<(GrayImage, f64, f64), Error> {
+    let t = Instant::now();
+    let img = image::load_from_memory(bytes)?;
+    let decode = ms_since(t);
+    let t = Instant::now();
+    let gray = img.into_luma8();
+    Ok((gray, decode, ms_since(t)))
 }
 
 /// See [`Scanner::match_line`].

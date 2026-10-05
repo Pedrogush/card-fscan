@@ -10,12 +10,13 @@ use fscan_core::geometry::{HEADER_Y, Rect, SLOT_PITCH};
 use fscan_core::image_ops::warp_rect;
 use fscan_core::matching::NameIndex;
 use fscan_core::ocr::{OcrLine, Recognizer};
+use fscan_core::profile::Profile;
 use fscan_core::{Error, Scanner};
 
 /// `locate` needs a Scanner, which needs a recogniser; this one never runs.
 struct NoOcr;
 impl Recognizer for NoOcr {
-    fn recognize(&self, lines: &[image::GrayImage]) -> Result<Vec<OcrLine>, Error> {
+    fn recognize(&self, lines: &[image::GrayImage], _: &Profile) -> Result<Vec<OcrLine>, Error> {
         Ok(lines.iter().map(|_| OcrLine { text: String::new(), confidence: 0.0 }).collect())
     }
 }
@@ -29,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ppm = 6.0;
     for photo_path in args {
         let photo = image::open(&photo_path)?.to_luma8();
-        let layout = scanner.locate(&photo);
+        let layout = scanner.locate(&photo, &Profile::new());
         let stem = PathBuf::from(&photo_path).file_stem().unwrap().to_string_lossy().to_string();
         for c in &layout.columns {
             let rect = Rect { x0: 0.0, y0: 0.0, x1: 70.0, y1: 330.0 };

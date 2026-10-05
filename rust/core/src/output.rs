@@ -84,15 +84,62 @@ pub struct CandidateOut {
     pub score: f64,
 }
 
-/// Wall-clock milliseconds per pipeline stage.
+/// Milliseconds per pipeline step (SPEC §4 requires `total`; the rest are
+/// extra keys). Top-level fields are wall-clock; `stages` is summed thread
+/// time of the fine-grained stages (see `profile.rs`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Timing {
-    pub total: u64,
-    pub detect: u64,
-    pub crop: u64,
-    pub ocr: u64,
+    /// End to end: decode + grayscale + scan + JSON (the CLI fills decode,
+    /// gray and json; `Scanner::scan` alone sets total = scan).
+    pub total: f64,
+    pub decode: f64,
+    pub gray: f64,
+    /// Everything inside `Scanner::scan`.
+    pub scan: f64,
+    /// Marker detection + layout.
+    pub detect: f64,
+    /// Primary slot crops (warp, line finding, trim, enhance).
+    pub crop: f64,
+    /// All OCR calls (both passes).
+    pub ocr: f64,
+    /// All matching (both passes).
     #[serde(rename = "match")]
-    pub match_: u64,
+    pub match_: f64,
+    /// Fallback pass total (crops + OCR + match), included in the above.
+    pub retry: f64,
+    pub json: f64,
+    pub stages: StageTimes,
+    pub counters: Counters,
+}
+
+/// Summed thread time per fine-grained stage, ms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageTimes {
+    pub detect: f64,
+    pub layout: f64,
+    pub warp: f64,
+    pub line_find: f64,
+    pub trim: f64,
+    pub enhance: f64,
+    pub ocr_prep: f64,
+    pub ocr_infer: f64,
+    pub ctc: f64,
+    pub clean: f64,
+    #[serde(rename = "match")]
+    pub match_: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Counters {
+    pub slots: u64,
+    pub ocr_calls: u64,
+    pub ocr_batches: u64,
+    pub ocr_lines: u64,
+    pub crops_per_slot: f64,
+    pub retry_slots: u64,
+    pub retry_crops: u64,
+    /// Sum over model runs of batch_size * padded input width (pixels).
+    pub ocr_input_px_wide: u64,
 }
 
 #[cfg(test)]
@@ -122,7 +169,7 @@ mod tests {
                     candidates: vec![CandidateOut { name: "Lightning Bolt".into(), oracle_id: "x".into(), score: 80.0 }],
                 }],
             }],
-            timing_ms: Timing { total: 12, ..Default::default() },
+            timing_ms: Timing { total: 12.0, ..Default::default() },
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["spec_version"], 1);
@@ -135,6 +182,8 @@ mod tests {
         assert_eq!(slot["status"], "review");
         assert!(slot["name"].is_null() && slot["oracle_id"].is_null() && slot["lang"].is_null());
         assert_eq!(slot["candidates"][0]["name"], "Lightning Bolt");
-        assert_eq!(v["timing_ms"]["total"], 12);
+        assert_eq!(v["timing_ms"]["total"], 12.0);
+        assert!(v["timing_ms"]["stages"]["ocr_infer"].is_number());
+        assert!(v["timing_ms"]["counters"]["ocr_lines"].is_number());
     }
 }

@@ -8,6 +8,7 @@ pub mod matching;
 pub mod ocr;
 pub mod output;
 pub mod pipeline;
+pub mod profile;
 
 pub use pipeline::{ScanParams, Scanner};
 // Re-exported so callers can write `fscan_core::Error`.

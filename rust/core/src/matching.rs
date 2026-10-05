@@ -13,6 +13,8 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
 use crate::Error;
+use crate::profile::{Profile, Stage};
+use std::time::Instant;
 
 pub const AUTO_MIN: f64 = 90.0;
 pub const AUTO_LEAD: f64 = 5.0;
@@ -296,16 +298,26 @@ impl NameIndex {
 
     /// Clean, normalise and score one raw OCR line against every key.
     pub fn match_raw(&self, raw: &str) -> MatchResult {
+        self.match_raw_profiled(raw, &Profile::new())
+    }
+
+    /// [`match_raw`](Self::match_raw), charging time to `prof`.
+    pub fn match_raw_profiled(&self, raw: &str, prof: &Profile) -> MatchResult {
+        let t = Instant::now();
         if !has_letter(raw) {
+            prof.add(Stage::Clean, t);
             return MatchResult::empty(String::new(), String::new());
         }
         let cleaned = clean(raw);
         let key = normalize(&cleaned);
+        prof.add(Stage::Clean, t);
         if key.is_empty() {
             return MatchResult::empty(cleaned, key);
         }
+        let t = Instant::now();
         let candidates = self.top_candidates(&key, 3);
         let status = accept(&candidates);
+        prof.add(Stage::Match, t);
         MatchResult { status, cleaned, key, candidates }
     }
 

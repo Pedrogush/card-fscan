@@ -69,11 +69,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .clone();
         let truth = &manifest["images"][&key];
         let photo = image::open(path)?.to_luma8();
-        let layout = scanner.locate(&photo);
-        let crops = scanner.crops(&photo, &layout);
+        let prof = fscan_core::profile::Profile::new();
+        let layout = scanner.locate(&photo, &prof);
+        let crops = scanner.crops(&photo, &layout, &prof);
         let t = Instant::now();
         let images: Vec<image::GrayImage> = crops.iter().map(|c| c.image.clone()).collect();
-        let lines = scanner.recognizer.recognize(&images)?;
+        let lines = scanner.recognizer.recognize(&images, &prof)?;
         ocr_ms += t.elapsed().as_millis();
         let slots = crops.iter().map(|c| (c.column, c.slot));
         for ((j, i), line) in slots.zip(&lines) {

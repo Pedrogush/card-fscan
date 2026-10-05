@@ -17,6 +17,8 @@ use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, NdTensorView, Tensor};
 
 use crate::Error;
+use crate::profile::{Count, Profile, Stage};
+use std::time::Instant;
 
 /// One recognised line.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +33,8 @@ pub struct OcrLine {
 ///
 /// `Send + Sync` lets one recogniser be shared between threads.
 pub trait Recognizer: Send + Sync {
-    fn recognize(&self, lines: &[GrayImage]) -> Result<Vec<OcrLine>, Error>;
+    /// Read every line image. Implementations charge their work to `prof`.
+    fn recognize(&self, lines: &[GrayImage], prof: &Profile) -> Result<Vec<OcrLine>, Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,12 +137,19 @@ impl RtenRecognizer {
         t
     }
 
-    fn run_batch(&self, lines: &[GrayImage]) -> Result<Vec<OcrLine>, Error> {
+    fn run_batch(&self, lines: &[GrayImage], prof: &Profile) -> Result<Vec<OcrLine>, Error> {
+        let t = Instant::now();
         let input: Tensor<f32> = self.prepare(lines).into();
+        prof.add(Stage::OcrPrep, t);
+        prof.count(Count::OcrBatches, 1);
+        prof.count(Count::OcrPixelsWide, (input.size(0) * input.size(3)) as u64);
+        let t = Instant::now();
         let output = self
             .model
             .run_one(input.view().into(), None)
             .map_err(|e| Error::Model(e.to_string()))?;
+        prof.add(Stage::OcrInfer, t);
+        let t = Instant::now();
         let mut probs: NdTensor<f32, 3> =
             output.try_into().map_err(|_| Error::Model("expected a 3-D recognition output".into()))?;
         if self.kind == ModelKind::Ocrs {
@@ -147,14 +157,16 @@ impl RtenRecognizer {
             probs.permute([1, 0, 2]);
         }
         let log_probs = self.kind == ModelKind::Ocrs;
-        Ok((0..lines.len())
-            .map(|n| ctc_greedy(probs.slice(n), &self.alphabet, log_probs))
-            .collect())
+        let out = (0..lines.len()).map(|n| ctc_greedy(probs.slice(n), &self.alphabet, log_probs)).collect();
+        prof.add(Stage::Ctc, t);
+        Ok(out)
     }
 }
 
 impl Recognizer for RtenRecognizer {
-    fn recognize(&self, lines: &[GrayImage]) -> Result<Vec<OcrLine>, Error> {
+    fn recognize(&self, lines: &[GrayImage], prof: &Profile) -> Result<Vec<OcrLine>, Error> {
+        prof.count(Count::OcrCalls, 1);
+        prof.count(Count::OcrLines, lines.len() as u64);
         // Batch lines of similar aspect ratio together so little compute is
         // wasted on right padding, then put the results back in input order.
         let mut order: Vec<usize> = (0..lines.len()).collect();
@@ -163,7 +175,7 @@ impl Recognizer for RtenRecognizer {
         let mut out = vec![None; lines.len()];
         for chunk in order.chunks(self.batch_size.max(1)) {
             let batch: Vec<GrayImage> = chunk.iter().map(|&i| lines[i].clone()).collect();
-            for (&i, line) in chunk.iter().zip(self.run_batch(&batch)?) {
+            for (&i, line) in chunk.iter().zip(self.run_batch(&batch, prof)?) {
                 out[i] = Some(line);
             }
         }

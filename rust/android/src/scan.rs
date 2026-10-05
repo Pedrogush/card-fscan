@@ -77,8 +77,8 @@ pub fn summarize(r: &PhotoResult) -> String {
     let _ = writeln!(s, "Auto-accepted: {auto}  (review: {review}, empty: {empty})");
     let _ = writeln!(
         s,
-        "Timing: total {} ms (detect {}, crop {}, ocr {}, match {})",
-        r.timing_ms.total, r.timing_ms.detect, r.timing_ms.crop, r.timing_ms.ocr, r.timing_ms.match_
+        "Timing: scan {:.0} ms (detect {:.0}, crop {:.0}, ocr {:.0}, match {:.0}; {} OCR lines)",
+        r.timing_ms.scan, r.timing_ms.detect, r.timing_ms.crop, r.timing_ms.ocr, r.timing_ms.match_, r.timing_ms.counters.ocr_lines
     );
     for c in &r.columns {
         let _ = writeln!(
