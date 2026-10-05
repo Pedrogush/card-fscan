@@ -16,7 +16,13 @@ kid-friendly 20-card half-decks.
 
 ## Status
 
-Design phase. No pipeline code yet.
+Active implementation: [`rust/`](rust/) (pipeline, CLI and Android app; see
+[`rust/README.md`](rust/README.md)). Shared contract: [`spec/SPEC.md`](spec/SPEC.md).
+Synthetic test data and scoring: [`tools/`](tools/) and [`testdata/`](testdata/).
+
+A parallel Kotlin implementation was built for comparison and is archived on the
+[`archive/kotlin`](https://github.com/Pedrogush/card-fscan/tree/archive/kotlin)
+branch (Phase 1: 94.4% auto-accept, 0 wrong on the dev set).
 
 ## License
 
