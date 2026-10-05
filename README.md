@@ -1,4 +1,4 @@
-# MTG-fscan — Shingle Scanner
+# card-fscan — Shingle Scanner
 
 Bulk Magic: The Gathering inventory by photographing shingled columns of cards
 (only the name bars visible) on printed fiducial strips, then reading each name
