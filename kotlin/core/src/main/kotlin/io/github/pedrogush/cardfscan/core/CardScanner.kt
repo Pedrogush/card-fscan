@@ -15,6 +15,7 @@ import io.github.pedrogush.cardfscan.core.vision.Marker
 import io.github.pedrogush.cardfscan.core.vision.MarkerDetector
 import io.github.pedrogush.cardfscan.core.vision.MarkerSelection
 import io.github.pedrogush.cardfscan.core.vision.SlotCropper
+import io.github.pedrogush.cardfscan.core.vision.TextLine
 import io.github.pedrogush.cardfscan.core.vision.TextLineFinder
 import org.opencv.core.Mat
 import org.opencv.imgcodecs.Imgcodecs
@@ -41,6 +42,13 @@ data class ScanOptions(
             "located" to listOf(
                 listOf(CropVariant("loc", Enhance.COLOR, locate = true)),
                 listOf(CropVariant("loc-inv", Enhance.INVERTED, locate = true)),
+                listOf(CropVariant("fixed", Enhance.COLOR, 0.5, 9.5)),
+            ),
+            "located+" to listOf(
+                listOf(CropVariant("loc", Enhance.COLOR, locate = true)),
+                listOf(CropVariant("loc-inv", Enhance.INVERTED, locate = true)),
+                listOf(CropVariant("loc-tall", Enhance.COLOR, locate = true, heightMm = 7.5)),
+                listOf(CropVariant("loc-clahe", Enhance.CLAHE, locate = true, heightMm = 4.5)),
                 listOf(CropVariant("fixed", Enhance.COLOR, 0.5, 9.5)),
             ),
         )
@@ -164,8 +172,11 @@ class CardScanner(
         var ocrCalls = 0L
         val best = HashMap<SlotKey, Reading>()
         var t = System.nanoTime()
-        val lines: Map<Int, DoubleArray> = plans.filter { it.rectifier != null }
-            .associate { it.column to lineFinder.find(columns.getValue(it.column), it.nCards) }
+        val lines: Map<Int, List<TextLine>> = plans.filter { it.rectifier != null }
+            .associate { p ->
+                val stopTop = p.stopSlot?.let { StripGeometry.slotTop(it) }
+                p.column to lineFinder.find(columns.getValue(p.column), p.nCards, stopTop)
+            }
         cropNs += System.nanoTime() - t
         var pending = plans.filter { it.rectifier != null }
             .flatMap { p -> (1..p.nCards).map { SlotKey(p.column, it) } }
@@ -174,7 +185,7 @@ class CardScanner(
             val jobs = pending.flatMap { key -> stage.map { v -> key to v } }
             t = System.nanoTime()
             val crops = jobs.map { (key, v) ->
-                cropper.crop(columns.getValue(key.column), key.slot, v, lines.getValue(key.column)[key.slot - 1])
+                cropper.crop(columns.getValue(key.column), key.slot, v, lines.getValue(key.column)[key.slot - 1].centreMm)
             }
             debugCrops(imageName, jobs, crops)
             cropNs += System.nanoTime() - t
@@ -185,7 +196,10 @@ class CardScanner(
             crops.forEach(Mat::release)
             t = System.nanoTime()
             jobs.forEachIndexed { i, (key, v) ->
-                val reading = Reading(v, texts[i], guardSpaces(guardHeadline(texts[i].text, index.match(texts[i].text))))
+                val ambiguous = lines.getValue(key.column)[key.slot - 1].ambiguous
+                var match = guardShort(guardSpaces(guardHeadline(texts[i].text, index.match(texts[i].text))))
+                if (ambiguous && match.status == SlotStatus.AUTO) match = match.copy(status = SlotStatus.REVIEW)
+                val reading = Reading(v, texts[i], match)
                 best[key] = better(best[key], reading)
             }
             matchNs += System.nanoTime() - t
@@ -210,6 +224,13 @@ class CardScanner(
     /** Stricter than the spec: the accepted name must also win when spaces are ignored (see [NameIndex.isRobustToSpaces]). */
     private fun guardSpaces(match: MatchResult): MatchResult =
         if (match.status == SlotStatus.AUTO && !index.isRobustToSpaces(match)) match.copy(status = SlotStatus.REVIEW) else match
+
+    /**
+     * Stricter than the spec: fewer than [MIN_AUTO_LETTERS] letters is never enough evidence
+     * ("Mo2*" from a mangled name matched the Portuguese card "Mó" exactly).
+     */
+    private fun guardShort(match: MatchResult): MatchResult =
+        if (match.status == SlotStatus.AUTO && match.key.count { it.isLetter() } < MIN_AUTO_LETTERS) match.copy(status = SlotStatus.REVIEW) else match
 
     /** "Keep the better-scoring result" (SPEC section 2, step 6): auto beats review beats empty, then match score. */
     private fun better(a: Reading?, b: Reading): Reading {
@@ -276,6 +297,10 @@ class CardScanner(
             val name = "${stem}_col${key.column}_s%02d_%s.png".format(key.slot, v.name)
             Imgcodecs.imwrite(File(dir, name).path, crops[i])
         }
+    }
+
+    companion object {
+        const val MIN_AUTO_LETTERS = 3
     }
 
     private fun msSince(t0: Long) = (System.nanoTime() - t0) / 1_000_000
