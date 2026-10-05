@@ -11,3 +11,17 @@ build/
 dist/
 .idea/
 .vscode/
+
+# Synthetic test images contain card art: regenerate from manifests, never commit
+testdata/**/*.jpg
+testdata/**/*.png
+testdata/cache/
+results/
+# Android / Gradle / Rust build outputs
+.gradle/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+target/
