@@ -42,7 +42,13 @@ The `.dict.txt` files are the character lists stored in each ONNX model's
 | rayon | MIT OR Apache-2.0 |
 | thiserror, anyhow | MIT OR Apache-2.0 |
 
+Android app only (`android/`): eframe/egui 0.36 (MIT OR Apache-2.0; egui's
+bundled default fonts are under SIL OFL-1.1 and the Ubuntu Font Licence 1.0),
+winit (Apache-2.0), android-activity, ndk, android_logger, log (MIT OR
+Apache-2.0). `self_cell` is dual "Apache-2.0 OR GPL-2.0-only" and is used under
+Apache-2.0.
+
 The full transitive list with licenses can be produced with
 `cargo tree -e normal --prefix none --format "{p} {l}" | sort -u`
 (see the README); at the time of writing every transitive crate is MIT,
-Apache-2.0, BSD, Zlib, Unicode-3.0 or similar permissive licenses.
+Apache-2.0, BSD, ISC, Zlib, Unlicense, Unicode-3.0 or OFL (fonts) — all permissive.
