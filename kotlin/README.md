@@ -79,7 +79,7 @@ uv run --project tools tools/eval.py --manifest testdata/smoke/manifest.json --r
 
 Options: `--index <names_v1.json[.gz]>` (default: found from the repo), `--model <onnx>`,
 `--threads <n>` (ONNX Runtime threads, default 2), `--debug <dir>` (dumps warped columns
-and every OCR crop), `--preset fixed|located`.
+and every OCR crop), `--preset fixed|located|located+` (`located+` adds two more fallback stages).
 
 The app: install the APK, wait for "Ready", then **Pick photo** (system Photo Picker) or
 **Take photo** (the system camera app writes a full-resolution JPEG into the app's
@@ -89,7 +89,39 @@ by the `copyScannerAssets` task in `app/build.gradle.kts`. Card images are never
 
 ## Evaluation results
 
-RESULTS_PLACEHOLDER
+Scored with `uv run --project tools tools/eval.py` on 2026-10-05, code at commit `31967fd`
+(default preset `located`). The targets are 0 wrong, at least 95% auto, exact column counts
+and correct retake detection.
+
+| Set | Photos | True slots | Auto & correct (scored slots) | Wrong autos | Review | Empty | Column-count errors | Status errors | Mean / median / max ms per photo |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| smoke | 8 | 593 | **95.40%** | **0** | 45 | 9 | 0 | 0 | 14,142 / 14,112 / 20,077 |
+| dev | 60 | 5,255 | **94.40%** (EN 93.4%, PT 97.3%) | **0** | 440 | 82 | 0 | 0 | 15,689 / 13,594 / 33,295 |
+
+"Scored" excludes `lang: other` printings and sideways split cards (see `eval_notes`).
+By difficulty on dev: easy 95.7%, normal 95.1%, hard 91.7%.
+
+**Timing.** Measured on this laptop: an Intel i5-3330 (2012, 4 cores, AVX but no AVX2/FMA)
+shared with two other build agents, with ONNX Runtime limited to 2 threads. About 87% of the
+time is OCR: ~110 crops per photo at ~125 ms each. Marker detection, warping, cropping and
+matching all 62,659 names take about 1.5 s together. A modern CPU or a phone with NEON
+should be several times faster.
+
+**What remains in review**, from inspecting the crops:
+- special frames whose top band is not the name: "Breaking News"-style headlines
+  (THE PROSPERITY POST, DAILY BUGLE, ARE YOU INFORMED?), Universes Beyond "flavour names"
+  (Scrounging Deathclaw, Basim, Meiko), and all-caps showcase names, which the caps guard
+  sends to review on purpose;
+- old-frame fonts and textured bars with one or two OCR slips (Sunken Ficlda, Electing Image);
+- names partly covered by a card placed high, and split cards;
+- `lang: other` printings, which are outside the index.
+
+**Safety guards that go beyond the spec** (each can only turn `auto` into `review`). All of
+them were added after an actual wrong auto in smoke or dev:
+- all-caps reading: headlines such as PROSPERITY are real names of *other* cards;
+- not robust to spaces: "WasteLand" read for the Un-card "Waste Land" matches "Wasteland";
+- fewer than 3 letters: "Mo" matched the Portuguese card "Mó";
+- ambiguous text line: the chosen line hugs the band edge while a rival line exists.
 
 ## Kotlin for newcomers
 
