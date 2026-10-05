@@ -47,6 +47,8 @@ pub const CARDS_PER_COLUMN: usize = 20;
 pub const STOP_CARD_ID: u16 = 40;
 /// The stop marker's top edge sits this far below the stop card's top edge.
 pub const STOP_MARKER_OFFSET: f64 = 3.0;
+/// Side of the stop card's marker (5 mm cells).
+pub const STOP_MARKER_SIZE: f64 = 30.0;
 /// Slot crops: x 4.5..65.5, inset 0.5 mm from the 10 mm band.
 pub const SLOT_X0: f64 = 4.5;
 pub const SLOT_X1: f64 = 65.5;

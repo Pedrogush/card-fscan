@@ -15,10 +15,11 @@ struct Args {
     out: PathBuf,
     names: PathBuf,
     model: PathBuf,
+    dump: Option<PathBuf>,
     images: Vec<PathBuf>,
 }
 
-const USAGE: &str = "usage: fscan scan --out <dir> [--names <names_v1.json[.gz]>] [--model <rec model>] <image>...";
+const USAGE: &str = "usage: fscan scan --out <dir> [--names <names_v1.json[.gz]>] [--model <rec model>] [--dump-crops <dir>] <image>...";
 
 /// Hand-rolled argument parsing keeps the dependency list short.
 fn parse_args() -> Result<Args> {
@@ -29,7 +30,8 @@ fn parse_args() -> Result<Args> {
     }
     let mut out = None;
     let mut names = root.join("testdata/names/names_v1.json");
-    let mut model = root.join("rust/models/en_PP-OCRv4_rec_mobile.onnx");
+    let mut model = root.join("rust/models/en_PP-OCRv5_rec_mobile.onnx");
+    let mut dump = None;
     let mut images = Vec::new();
     while let Some(a) = args.next() {
         // `ok_or_else` turns a missing value into an error; `?` returns it.
@@ -38,6 +40,7 @@ fn parse_args() -> Result<Args> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--names" => names = PathBuf::from(value()?),
             "--model" => model = PathBuf::from(value()?),
+            "--dump-crops" => dump = Some(PathBuf::from(value()?)),
             "-h" | "--help" => bail!(USAGE),
             _ => images.push(PathBuf::from(a)),
         }
@@ -46,7 +49,7 @@ fn parse_args() -> Result<Args> {
     if images.is_empty() {
         bail!(USAGE);
     }
-    Ok(Args { out, names, model, images })
+    Ok(Args { out, names, model, dump, images })
 }
 
 fn main() -> Result<()> {
@@ -56,7 +59,11 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let index = NameIndex::load(&args.names).with_context(|| format!("loading {}", args.names.display()))?;
     let recognizer = RtenRecognizer::load(&args.model).with_context(|| format!("loading {}", args.model.display()))?;
-    let scanner = Scanner::new(index, Box::new(recognizer));
+    let mut scanner = Scanner::new(index, Box::new(recognizer));
+    if let Some(dir) = &args.dump {
+        std::fs::create_dir_all(dir)?;
+        scanner.params.dump_dir = Some(dir.clone());
+    }
     eprintln!("loaded {} names and the OCR model in {} ms", scanner.index.len(), t.elapsed().as_millis());
 
     let mut total_ms = 0u128;

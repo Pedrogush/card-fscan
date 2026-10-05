@@ -60,6 +60,11 @@ pub struct RtenRecognizer {
     pub batch_size: usize,
     /// Widest input (pixels after resizing) a line may have.
     pub max_width: u32,
+    /// Height lines are resized to (the model's training height by default).
+    pub input_height: u32,
+    /// Horizontal squeeze applied after resizing to `input_height` (1.0 =
+    /// keep the aspect ratio). Narrower inputs are proportionally faster.
+    pub width_scale: f64,
 }
 
 /// The `ocrs` model's character set (copied from the ocrs crate, MIT/Apache).
@@ -87,7 +92,8 @@ impl RtenRecognizer {
             Some(d) => (ModelKind::PaddleRec, parse_dict(d)),
             None => (ModelKind::Ocrs, OCRS_ALPHABET.chars().collect()),
         };
-        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 16, max_width: 640 })
+        let input_height = kind.input_height();
+        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 8, max_width: 640, input_height, width_scale: 1.0 })
     }
 
     pub fn kind(&self) -> ModelKind {
@@ -97,11 +103,11 @@ impl RtenRecognizer {
     /// Resize lines to the model height and pack them into one NCHW tensor,
     /// padded on the right to the widest line.
     fn prepare(&self, lines: &[GrayImage]) -> NdTensor<f32, 4> {
-        let h = self.kind.input_height();
+        let h = self.input_height;
         let resized: Vec<GrayImage> = lines
             .iter()
             .map(|img| {
-                let w = ((img.width() as f64 * h as f64 / img.height().max(1) as f64).round() as u32)
+                let w = ((self.width_scale * img.width() as f64 * h as f64 / img.height().max(1) as f64).round() as u32)
                     .clamp(h / 2, self.max_width);
                 resize(img, w, h, FilterType::Triangle)
             })
@@ -149,11 +155,20 @@ impl RtenRecognizer {
 
 impl Recognizer for RtenRecognizer {
     fn recognize(&self, lines: &[GrayImage]) -> Result<Vec<OcrLine>, Error> {
-        let mut out = Vec::with_capacity(lines.len());
-        for chunk in lines.chunks(self.batch_size.max(1)) {
-            out.extend(self.run_batch(chunk)?);
+        // Batch lines of similar aspect ratio together so little compute is
+        // wasted on right padding, then put the results back in input order.
+        let mut order: Vec<usize> = (0..lines.len()).collect();
+        let aspect = |i: usize| lines[i].width() as f64 / lines[i].height().max(1) as f64;
+        order.sort_by(|&a, &b| aspect(a).total_cmp(&aspect(b)));
+        let mut out = vec![None; lines.len()];
+        for chunk in order.chunks(self.batch_size.max(1)) {
+            let batch: Vec<GrayImage> = chunk.iter().map(|&i| lines[i].clone()).collect();
+            for (&i, line) in chunk.iter().zip(self.run_batch(&batch)?) {
+                out[i] = Some(line);
+            }
         }
-        Ok(out)
+        // Every slot was filled above, so `flatten` drops nothing.
+        Ok(out.into_iter().flatten().collect())
     }
 }
 
