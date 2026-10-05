@@ -48,11 +48,11 @@ class MatchCasesTest {
     @Test
     fun ratioMatchesRapidfuzzExamples() {
         // Values from rapidfuzz.fuzz.ratio.
-        assertEquals(100f, Pattern.ratio("abc", "abc"))
-        assertEquals(0f, Pattern.ratio("abc", "xyz"))
-        assertEquals(2f * 3 / 7 * 100, Pattern.ratio("abcd", "abd"), 1e-4f)
+        assertEquals(100f, IndelPattern.ratio("abc", "abc"))
+        assertEquals(0f, IndelPattern.ratio("abc", "xyz"))
+        assertEquals(2f * 3 / 7 * 100, IndelPattern.ratio("abcd", "abd"), 1e-4f)
         // One substitution = one delete + one insert: LCS 13 of 14 + 14 chars.
-        assertEquals(100f * 26 / 28, Pattern.ratio("lightning bolt", "lightnimg bolt"), 1e-4f)
+        assertEquals(100f * 26 / 28, IndelPattern.ratio("lightning bolt", "lightnimg bolt"), 1e-4f)
     }
 
     @Test
@@ -60,8 +60,8 @@ class MatchCasesTest {
         val a = "a".repeat(70) + " bolt " + "z".repeat(30)
         val b = "a".repeat(69) + " boltz " + "z".repeat(29)
         // Reference: plain O(n*m) dynamic programme.
-        assertEquals(dpRatio(a, b), Pattern.ratio(a, b), 1e-4f)
-        assertEquals(dpRatio(b, a), Pattern.ratio(b, a), 1e-4f)
+        assertEquals(dpRatio(a, b), IndelPattern.ratio(a, b), 1e-4f)
+        assertEquals(dpRatio(b, a), IndelPattern.ratio(b, a), 1e-4f)
     }
 
     @Test
@@ -86,4 +86,17 @@ class MatchCasesTest {
     // Extension functions: add small helpers to an existing type (here JsonObject) without subclassing.
     private fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.contentOrNull
     private fun JsonObject.num(k: String): Double? = (this[k] as? JsonPrimitive)?.doubleOrNull
+}
+
+class SpaceGuardTest {
+    @Test
+    fun droppedSpaceBetweenTwoRealNamesIsNotTrusted() {
+        val index = io.github.pedrogush.cardfscan.core.TestPaths.nameIndex
+        // "Waste Land" (Un-card) read without its space matches "Wasteland" exactly.
+        val r = index.match("WasteLand")
+        assertEquals(SlotStatus.AUTO, r.status)
+        assertEquals(false, index.isRobustToSpaces(r))
+        // An ordinary name is unaffected.
+        assertEquals(true, index.isRobustToSpaces(index.match("Lightning Bolt")))
+    }
 }

@@ -5,7 +5,7 @@ package io.github.pedrogush.cardfscan.core.match
  * (equal to `rapidfuzz.fuzz.ratio`).
  *
  * The insert/delete-only edit distance satisfies `indel = len(a) + len(b) - 2 * LCS(a, b)`,
- * so we only need the length of the longest common subsequence. [Pattern] computes it with
+ * so we only need the length of the longest common subsequence. [IndelPattern] computes it with
  * the bit-parallel algorithm of Hyyrö (2004): one machine word holds the DP column for 64
  * characters of the pattern, so comparing a ~20-char query against a ~20-char key costs
  * about 20 word operations. That makes brute force over the whole ~60k-key index cheap.
@@ -13,7 +13,7 @@ package io.github.pedrogush.cardfscan.core.match
  * Normalised keys only contain `a-z`, `0-9` and space (37 symbols), which keeps the
  * per-symbol bit masks in a tiny array.
  */
-class Pattern(val text: String) {
+class IndelPattern(val text: String) {
     private val blocks = (text.length + 63) / 64
     /** masks[symbol * blocks + block]: bit i set when text[64*block + i] == symbol. */
     private val masks = LongArray(ALPHABET * blocks)
@@ -91,6 +91,6 @@ class Pattern(val text: String) {
         private fun symbolOfByte(b: Byte): Int = symbolOf(b.toInt().toChar())
 
         /** Convenience for tests: ratio of two already-normalised strings. */
-        fun ratio(a: String, b: String): Float = Pattern(a).ratio(b.toByteArray(Charsets.US_ASCII))
+        fun ratio(a: String, b: String): Float = IndelPattern(a).ratio(b.toByteArray(Charsets.US_ASCII))
     }
 }

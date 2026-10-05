@@ -185,7 +185,7 @@ class CardScanner(
             crops.forEach(Mat::release)
             t = System.nanoTime()
             jobs.forEachIndexed { i, (key, v) ->
-                val reading = Reading(v, texts[i], guardHeadline(texts[i].text, index.match(texts[i].text)))
+                val reading = Reading(v, texts[i], guardSpaces(guardHeadline(texts[i].text, index.match(texts[i].text))))
                 best[key] = better(best[key], reading)
             }
             matchNs += System.nanoTime() - t
@@ -206,6 +206,10 @@ class CardScanner(
      */
     private fun guardHeadline(raw: String, match: MatchResult): MatchResult =
         if (match.status == SlotStatus.AUTO && TextNormalizer.looksLikeHeadline(raw)) match.copy(status = SlotStatus.REVIEW) else match
+
+    /** Stricter than the spec: the accepted name must also win when spaces are ignored (see [NameIndex.isRobustToSpaces]). */
+    private fun guardSpaces(match: MatchResult): MatchResult =
+        if (match.status == SlotStatus.AUTO && !index.isRobustToSpaces(match)) match.copy(status = SlotStatus.REVIEW) else match
 
     /** "Keep the better-scoring result" (SPEC section 2, step 6): auto beats review beats empty, then match score. */
     private fun better(a: Reading?, b: Reading): Reading {

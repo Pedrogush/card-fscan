@@ -46,12 +46,38 @@ class NameIndex(val entries: List<NameEntry>, val source: String = "") {
     private val keyBytes: Array<ByteArray> = Array(entries.size) { entries[it].key.toByteArray(Charsets.US_ASCII) }
     /** Distinct oracle_ids, sorted ascending: the index in this list doubles as the tie-breaker. */
     private val oracleIds: List<String> = entries.map { it.oracleId }.distinct().sorted()
-    private val entryOracle: IntArray = run {
-        val pos = oracleIds.withIndex().associate { (i, id) -> id to i }
-        IntArray(entries.size) { pos.getValue(entries[it].oracleId) }
+    private val oraclePosition: Map<String, Int> = oracleIds.withIndex().associate { (i, id) -> id to i }
+    private val entryOracle: IntArray = IntArray(entries.size) { oraclePosition.getValue(entries[it].oracleId) }
+
+    /** Keys with spaces removed, for [isRobustToSpaces]. */
+    private val compactKeyBytes: Array<ByteArray> by lazy {
+        Array(entries.size) { entries[it].key.replace(" ", "").toByteArray(Charsets.US_ASCII) }
     }
 
     val size get() = entries.size
+
+    /**
+     * Extra safety check on top of SPEC section 3 (it can only turn `auto` into `review`).
+     *
+     * OCR sometimes drops or invents a space, and some names differ only by a space
+     * ("Wasteland" vs the Un-card "Waste Land"). We recompute the scores with spaces removed
+     * from both the query and every key, and require the accepted oracle_id to still lead
+     * every other oracle_id by [AUTO_LEAD].
+     */
+    fun isRobustToSpaces(result: MatchResult): Boolean {
+        val best = result.best ?: return false
+        val query = result.key.replace(" ", "")
+        if (query.isEmpty()) return false
+        val pattern = IndelPattern(query)
+        val bestOracle = oraclePosition.getValue(best.oracleId)
+        var own = -1f
+        var other = -1f
+        for (e in compactKeyBytes.indices) {
+            val s = pattern.ratio(compactKeyBytes[e])
+            if (entryOracle[e] == bestOracle) own = maxOf(own, s) else other = maxOf(other, s)
+        }
+        return round4(own) - round4(other) >= AUTO_LEAD - EPS
+    }
 
     fun match(raw: String): MatchResult {
         if (!TextNormalizer.hasLetter(raw)) return MatchResult(SlotStatus.EMPTY, "", "")
@@ -60,7 +86,7 @@ class NameIndex(val entries: List<NameEntry>, val source: String = "") {
         if (key.isEmpty()) return MatchResult(SlotStatus.EMPTY, cleaned, key)
 
         // Best score per oracle_id, and the first entry (in file order) that reaches it.
-        val pattern = Pattern(key)
+        val pattern = IndelPattern(key)
         val bestScore = FloatArray(oracleIds.size) { -1f }
         val bestEntry = IntArray(oracleIds.size) { -1 }
         for (e in keyBytes.indices) {
