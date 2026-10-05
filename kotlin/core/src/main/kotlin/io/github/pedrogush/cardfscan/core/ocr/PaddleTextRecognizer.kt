@@ -3,6 +3,7 @@ package io.github.pedrogush.cardfscan.core.ocr
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import org.opencv.core.Mat
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
@@ -16,7 +17,8 @@ import kotlin.math.roundToInt
  * The model takes a batch of BGR images 48 px high, normalised to [-1, 1], and outputs per
  * time step (one per 8 px of width) a probability for each class: class 0 is the CTC
  * "blank", then the characters of the dictionary, then a space. The dictionary is stored in
- * the ONNX file's metadata under the key `character` (RapidOCR exports do this).
+ * the ONNX file's metadata under the key `character` (RapidOCR exports do this); it is read
+ * with [OnnxMetadata] and checked against the model's output size.
  *
  * @param modelBytes the .onnx file contents.
  * @param threads ONNX Runtime intra-op threads.
@@ -42,9 +44,13 @@ class PaddleTextRecognizer(
         }
         session = env.createSession(modelBytes, options)
         inputName = session.inputNames.first()
-        val dict = session.metadata.customMetadata["character"]
+        val dict = OnnxMetadata.read(modelBytes)["character"]
             ?: error("model has no 'character' metadata; supply a RapidOCR-style export")
         classes = listOf("") + dict.split('\n').dropLastWhile { it.isEmpty() } + listOf(" ")
+        val modelClasses = (session.outputInfo.values.first().info as TensorInfo).shape.last()
+        check(modelClasses == classes.size.toLong()) {
+            "dictionary has ${classes.size} classes but the model outputs $modelClasses"
+        }
     }
 
     override fun recognize(crops: List<Mat>): List<OcrLine> {

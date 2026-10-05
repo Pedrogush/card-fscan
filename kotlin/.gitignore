@@ -11,3 +11,4 @@ results/
 *.png
 .idea/
 *.iml
+*.log

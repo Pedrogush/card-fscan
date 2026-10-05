@@ -5,6 +5,7 @@ import io.github.pedrogush.cardfscan.core.geometry.StripGeometry
 import io.github.pedrogush.cardfscan.core.match.MatchResult
 import io.github.pedrogush.cardfscan.core.match.NameIndex
 import io.github.pedrogush.cardfscan.core.match.SlotStatus
+import io.github.pedrogush.cardfscan.core.match.TextNormalizer
 import io.github.pedrogush.cardfscan.core.ocr.OcrLine
 import io.github.pedrogush.cardfscan.core.ocr.TextRecognizer
 import io.github.pedrogush.cardfscan.core.vision.ColumnRectifier
@@ -12,7 +13,9 @@ import io.github.pedrogush.cardfscan.core.vision.CropVariant
 import io.github.pedrogush.cardfscan.core.vision.Enhance
 import io.github.pedrogush.cardfscan.core.vision.Marker
 import io.github.pedrogush.cardfscan.core.vision.MarkerDetector
+import io.github.pedrogush.cardfscan.core.vision.MarkerSelection
 import io.github.pedrogush.cardfscan.core.vision.SlotCropper
+import io.github.pedrogush.cardfscan.core.vision.TextLineFinder
 import org.opencv.core.Mat
 import org.opencv.imgcodecs.Imgcodecs
 import java.io.File
@@ -58,6 +61,7 @@ class CardScanner(
 ) {
     private val detector = MarkerDetector()
     private val cropper = SlotCropper()
+    private val lineFinder = TextLineFinder()
 
     fun scanFile(file: File): ScanReport {
         val start = System.nanoTime()
@@ -79,15 +83,14 @@ class CardScanner(
         val start = System.nanoTime()
         val timing = linkedMapOf<String, Long>()
 
-        // 1. Markers. If an id was detected twice, keep the larger (more reliable) copy.
+        // 1. Markers; stray ids decoded from card art are filtered out (see MarkerSelection).
         val markers = detector.detect(image)
-        val byId = markers.filter { it.id != StripGeometry.STOP_CARD_ID }
-            .groupBy { it.id }.mapValues { (_, list) -> list.maxBy { it.perimeter } }
+        val byId = MarkerSelection.headerMarkers(markers)
         val stopMarkers = markers.filter { it.id == StripGeometry.STOP_CARD_ID }
         timing["markers"] = msSince(start)
 
         // 2. Config and column presence.
-        val config: Config = StripGeometry.configFor(byId.keys)
+        val config: Config = MarkerSelection.config(byId)
         val plans = (1..config.columns).map { j -> planColumn(j, byId, stopMarkers) }
         val photoOk = plans.all { it.rectifier != null }
 
@@ -160,23 +163,29 @@ class CardScanner(
         var matchNs = 0L
         var ocrCalls = 0L
         val best = HashMap<SlotKey, Reading>()
+        var t = System.nanoTime()
+        val lines: Map<Int, DoubleArray> = plans.filter { it.rectifier != null }
+            .associate { it.column to lineFinder.find(columns.getValue(it.column), it.nCards) }
+        cropNs += System.nanoTime() - t
         var pending = plans.filter { it.rectifier != null }
             .flatMap { p -> (1..p.nCards).map { SlotKey(p.column, it) } }
         for (stage in options.stages) {
             if (pending.isEmpty()) break
             val jobs = pending.flatMap { key -> stage.map { v -> key to v } }
-            var t = System.nanoTime()
-            val crops = jobs.map { (key, v) -> cropper.crop(columns.getValue(key.column), key.slot, v) }
+            t = System.nanoTime()
+            val crops = jobs.map { (key, v) ->
+                cropper.crop(columns.getValue(key.column), key.slot, v, lines.getValue(key.column)[key.slot - 1])
+            }
             debugCrops(imageName, jobs, crops)
             cropNs += System.nanoTime() - t
             t = System.nanoTime()
-            val lines = recognizer.recognize(crops)
+            val texts = recognizer.recognize(crops)
             ocrNs += System.nanoTime() - t
             ocrCalls += crops.size
             crops.forEach(Mat::release)
             t = System.nanoTime()
             jobs.forEachIndexed { i, (key, v) ->
-                val reading = Reading(v, lines[i], index.match(lines[i].text))
+                val reading = Reading(v, texts[i], guardHeadline(texts[i].text, index.match(texts[i].text)))
                 best[key] = better(best[key], reading)
             }
             matchNs += System.nanoTime() - t
@@ -188,6 +197,15 @@ class CardScanner(
         timing["ocr_crops"] = ocrCalls
         return best
     }
+
+    /**
+     * Stricter than the spec, never looser: an all-caps reading is never auto-accepted.
+     * Real names print in mixed case; all-caps bands on special frames ("Breaking News"
+     * headlines such as THE PROSPERITY POST) often show a word that is a *different* card's
+     * name. The few caps-style name frames just go to review.
+     */
+    private fun guardHeadline(raw: String, match: MatchResult): MatchResult =
+        if (match.status == SlotStatus.AUTO && TextNormalizer.looksLikeHeadline(raw)) match.copy(status = SlotStatus.REVIEW) else match
 
     /** "Keep the better-scoring result" (SPEC section 2, step 6): auto beats review beats empty, then match score. */
     private fun better(a: Reading?, b: Reading): Reading {

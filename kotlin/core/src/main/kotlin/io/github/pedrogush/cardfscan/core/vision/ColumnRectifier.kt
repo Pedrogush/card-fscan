@@ -7,6 +7,7 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import kotlin.math.hypot
 
 /**
  * One column's mapping from photo pixels to strip millimetres (SPEC section 2, step 3).
@@ -43,11 +44,18 @@ class ColumnRectifier(val imageToMm: Homography) {
         val mm = stopMarker.corners.map(::toMm)
         val cx = mm.sumOf { it.x } / 4
         if (cx < 0.0 || cx >= StripGeometry.STRIP_WIDTH) return null
+        // A stray id 40 decoded from card art will not be a 30 mm square.
+        val sides = (0 until 4).map { k -> distance(mm[k], mm[(k + 1) % 4]) }
+        if (sides.any { it !in STOP_SIDE_MM * 0.75..STOP_SIDE_MM * 1.25 }) return null
         val topY = mm.map { it.y }.sorted().take(2).average()
         return StripGeometry.stopCardSlot(topY)
     }
 
+    private fun distance(a: Point2, b: Point2) = hypot(a.x - b.x, a.y - b.y)
+
     companion object {
+        const val STOP_SIDE_MM = 30.0
+
         /** Fits the column homography from the left and right header markers. */
         fun fromHeaderMarkers(left: Marker, right: Marker): ColumnRectifier {
             val image = left.corners + right.corners

@@ -25,6 +25,12 @@ object TextNormalizer {
         return joined.trimEnd { it in TRAILING_JUNK || it.isWhitespace() }.trim()
     }
 
+    /** True for text in capitals (4+ letters, at least 90% upper case), like a headline banner. */
+    fun looksLikeHeadline(raw: String): Boolean {
+        val letters = raw.filter { it.isLetter() }
+        return letters.length >= 4 && letters.count { it.isUpperCase() } >= 0.9 * letters.length
+    }
+
     /** NFKD, drop combining marks, lowercase, map anything outside `[a-z0-9 ]` to a space, collapse spaces. */
     fun normalize(s: String): String {
         val decomposed = Normalizer.normalize(s, Normalizer.Form.NFKD)

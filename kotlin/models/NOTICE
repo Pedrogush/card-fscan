@@ -1,0 +1,13 @@
+latin_PP-OCRv5_rec_mobile.onnx
+==============================
+
+PP-OCRv5 mobile text-line recognition model for Latin-script languages.
+
+- Original model: PaddleOCR (https://github.com/PaddlePaddle/PaddleOCR),
+  Copyright (c) PaddlePaddle Authors. Licensed under the Apache License 2.0.
+- ONNX conversion (with the character dictionary embedded in the model's
+  metadata under the key "character"): RapidOCR / RapidAI
+  (https://github.com/RapidAI/RapidOCR, Apache License 2.0), downloaded from
+  https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile.onnx
+- SHA-256: b20bd37c168a570f583afbc8cd7925603890efbcdc000a59e22c269d160b5f5a
+- Unmodified. Licence text: LICENSE-Apache-2.0.txt in this folder.
