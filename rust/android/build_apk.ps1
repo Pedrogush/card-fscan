@@ -90,13 +90,12 @@ try { $in.CopyTo($gz) } finally { $gz.Dispose(); $out.Dispose(); $in.Dispose() }
 
 # OCR model + dictionary
 $modelDirs = @(
-    (Join-Path $RustDir 'models'),
-    'C:\Users\Pedro\AppData\Local\Temp\claude\C--Claude-My-projects-MTG-fscan\f23b9e8a-535b-4b8d-93ba-95f8c5eca9da\scratchpad\models'
+    (Join-Path $RustDir 'models')
 )
-$modelDir = $modelDirs | Where-Object { Test-Path (Join-Path $_ 'en_PP-OCRv4_rec_mobile.onnx') } | Select-Object -First 1
-if (-not $modelDir) { throw "OCR model en_PP-OCRv4_rec_mobile.onnx not found in: $($modelDirs -join ', ')" }
-Copy-Item (Join-Path $modelDir 'en_PP-OCRv4_rec_mobile.onnx') (Join-Path $AssetsDir 'rec.onnx')
-Copy-Item (Join-Path $modelDir 'en_PP-OCRv4_rec_mobile.dict.txt') (Join-Path $AssetsDir 'rec.dict.txt')
+$modelDir = $modelDirs | Where-Object { Test-Path (Join-Path $_ 'en_PP-OCRv5_rec_mobile.onnx') } | Select-Object -First 1
+if (-not $modelDir) { throw "OCR model en_PP-OCRv5_rec_mobile.onnx not found in: $($modelDirs -join ', ')" }
+Copy-Item (Join-Path $modelDir 'en_PP-OCRv5_rec_mobile.onnx') (Join-Path $AssetsDir 'rec.onnx')
+Copy-Item (Join-Path $modelDir 'en_PP-OCRv5_rec_mobile.dict.txt') (Join-Path $AssetsDir 'rec.dict.txt')
 
 if ($Sample) {
     if (-not (Test-Path $Sample)) { throw "sample photo not found: $Sample" }

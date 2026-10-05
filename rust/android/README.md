@@ -68,7 +68,7 @@ unoptimised; "debug APK" only means it is signed with the debug key
 
 `assets/` and `build/` are generated (gitignored). Assets come from
 `testdata/names/names_v1.json` (gzipped by the script) and
-`rust/models/en_PP-OCRv4_rec_mobile.{onnx,dict.txt}`.
+`rust/models/en_PP-OCRv5_rec_mobile.{onnx,dict.txt}`.
 
 ## Getting a photo onto the phone
 

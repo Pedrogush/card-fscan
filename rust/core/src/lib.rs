@@ -10,6 +10,8 @@ pub mod output;
 pub mod pipeline;
 
 pub use pipeline::{ScanParams, Scanner};
+// Re-exported so callers can write `fscan_core::Error`.
+
 
 /// Errors returned by the library. `thiserror` derives `Display` and `From`.
 #[derive(Debug, thiserror::Error)]

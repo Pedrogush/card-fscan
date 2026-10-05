@@ -1,6 +1,8 @@
 target/
 results/
 models/*.onnx
+# The production OCR model is small (7.9 MB, Apache-2.0) and committed.
+!models/en_PP-OCRv5_rec_mobile.onnx
 models/*.rten
 android/assets/
 *.apk

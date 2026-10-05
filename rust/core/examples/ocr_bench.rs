@@ -72,9 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let layout = scanner.locate(&photo);
         let crops = scanner.crops(&photo, &layout);
         let t = Instant::now();
-        let lines = scanner.recognizer.recognize(&crops)?;
+        let images: Vec<image::GrayImage> = crops.iter().map(|c| c.image.clone()).collect();
+        let lines = scanner.recognizer.recognize(&images)?;
         ocr_ms += t.elapsed().as_millis();
-        let slots = layout.columns.iter().flat_map(|c| (1..=c.n_cards).map(move |i| (c.geometry.column, i)));
+        let slots = crops.iter().map(|c| (c.column, c.slot));
         for ((j, i), line) in slots.zip(&lines) {
             let col = truth["columns"].as_array().unwrap().iter().find(|c| c["column"] == j).unwrap();
             let Some(ts) = col["slots"].as_array().unwrap().iter().find(|s| s["slot"] == i) else { continue };

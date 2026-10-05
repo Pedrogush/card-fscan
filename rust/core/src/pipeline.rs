@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use crate::Error;
 use crate::aruco::{self, DetectorParams, Marker};
-use crate::geometry::{self, CARDS_PER_COLUMN, PX_PER_MM, Point, STOP_CARD_ID, STRIP_W, Side};
+use crate::geometry::{self, CARDS_PER_COLUMN, PX_PER_MM, Point, Rect, STOP_CARD_ID, STRIP_W, Side};
 use crate::homography::Homography;
 use crate::image_ops::{clahe, invert, warp_rect};
 use crate::matching::{MatchResult, MatchStatus, NameIndex};
@@ -145,15 +145,30 @@ impl Scanner {
     }
 
     /// SPEC §2.5: one OCR-ready crop per card, column by column, slot 1 first.
-    pub fn crops(&self, photo: &GrayImage, layout: &Layout) -> Vec<GrayImage> {
+    ///
+    /// The header-only homography is extrapolated a long way (the markers
+    /// are 18 mm tall, slot 20 is 200 mm further down), so on tilted or
+    /// distorted photos it can drift by several mm at the bottom of a
+    /// column. We therefore walk down each column and centre every slot's
+    /// text search on the drift predicted from the name lines already found
+    /// above it (see [`predict_shift`]). Slot numbering is unchanged.
+    pub fn crops(&self, photo: &GrayImage, layout: &Layout) -> Vec<SlotCrop> {
         layout
             .columns
-            .iter()
-            .flat_map(|c| (1..=c.n_cards).map(move |i| (c, i)))
-            .collect::<Vec<_>>()
-            // Warping is independent per slot: do it on all cores.
-            .into_par_iter()
-            .map(|(c, i)| self.slot_crop(photo, &c.geometry, i))
+            .par_iter()
+            .flat_map_iter(|c| {
+                let mut offsets: Vec<f64> = Vec::with_capacity(c.n_cards);
+                (1..=c.n_cards)
+                    .map(|i| {
+                        let shift_mm = predict_shift(&offsets);
+                        let (image, offset) = self
+                            .slot_crop(photo, &c.geometry, i, shift_mm, CropVariant::Primary)
+                            .expect("primary crop always exists");
+                        offsets.push(offset);
+                        SlotCrop { column: c.geometry.column, slot: i, shift_mm, image }
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -170,32 +185,52 @@ impl Scanner {
         let crops = self.crops(photo, &layout);
         if let Some(dir) = &self.params.dump_dir {
             let stem = image_name.rsplit_once('.').map_or(image_name, |(s, _)| s);
-            let names = layout.columns.iter().flat_map(|c| (1..=c.n_cards).map(move |i| (c.geometry.column, i)));
-            for ((j, i), crop) in names.zip(&crops) {
+            for c in &crops {
                 // Debug output only: ignore write errors.
-                let _ = crop.save(dir.join(format!("{stem}_c{j}_s{i:02}.png")));
+                let _ = c.image.save(dir.join(format!("{stem}_c{}_s{:02}.png", c.column, c.slot)));
             }
         }
         timing.crop = t_crop.elapsed().as_millis() as u64;
 
         // SPEC §2.6-2.7, pass 1: OCR + match the crops as they are.
         let t_ocr = Instant::now();
-        let lines = self.recognizer.recognize(&crops)?;
+        let images: Vec<GrayImage> = crops.iter().map(|c| c.image.clone()).collect();
+        let lines = self.recognizer.recognize(&images)?;
         timing.ocr = t_ocr.elapsed().as_millis() as u64;
         let t_match = Instant::now();
         let mut reads = self.match_all(lines);
         timing.match_ = t_match.elapsed().as_millis() as u64;
 
-        // Pass 2: slots that didn't auto-accept get a second chance with the
-        // inverted crop (white-on-dark name bars); the better match wins.
-        if self.params.try_inverted {
-            let retry: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
-            let inverted: Vec<GrayImage> = retry.iter().map(|&k| invert(&crops[k])).collect();
+        // Pass 2: slots that didn't auto-accept get more attempts: the
+        // inverted crop (white-on-dark name bars), the second-best text line
+        // and the untrimmed line. The best-scoring match wins.
+        let retry: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
+        if !retry.is_empty() {
+            let geometry_of =
+                |j: usize| &layout.columns.iter().find(|c| c.geometry.column == j).expect("crop of a known column").geometry;
+            let mut variants = vec![CropVariant::SecondLine, CropVariant::Untrimmed];
+            if self.params.try_inverted {
+                variants.push(CropVariant::Inverted);
+            }
+            let t_crop = Instant::now();
+            // (read index, crop) for every fallback crop that exists.
+            let jobs: Vec<(usize, GrayImage)> = retry
+                .par_iter()
+                .flat_map_iter(|&k| {
+                    let c = &crops[k];
+                    let g = geometry_of(c.column);
+                    variants
+                        .iter()
+                        .filter_map(move |&v| self.slot_crop(photo, g, c.slot, c.shift_mm, v).map(|(img, _)| (k, img)))
+                })
+                .collect();
+            timing.crop += t_crop.elapsed().as_millis() as u64;
+            let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
             let t_ocr = Instant::now();
-            let lines = self.recognizer.recognize(&inverted)?;
+            let lines = self.recognizer.recognize(&extra)?;
             timing.ocr += t_ocr.elapsed().as_millis() as u64;
             let t_match = Instant::now();
-            for (k, alt) in retry.into_iter().zip(self.match_all(lines)) {
+            for (k, alt) in owners.into_iter().zip(self.match_all(lines)) {
                 if alt.better_than(&reads[k]) {
                     reads[k] = alt;
                 }
@@ -241,30 +276,142 @@ impl Scanner {
     /// Match OCR lines against the name index in parallel (rayon's
     /// `into_par_iter` spreads the work over all cores; `collect` keeps order).
     fn match_all(&self, lines: Vec<OcrLine>) -> Vec<Read> {
-        lines.into_par_iter().map(|line| Read { m: self.index.match_raw(&line.text), line }).collect()
+        lines.into_par_iter().map(|line| self.match_line(line)).collect()
+    }
+
+    /// Match one OCR line. Mana costs read as letters (`Dig Through Time
+    /// 6UU`) survive SPEC cleaning, so when the last token looks like a mana
+    /// cost we also try without it and keep the better match.
+    ///
+    /// A reading of fewer than `MIN_AUTO_CHARS` letters/digits is almost
+    /// always a fragment (one glyph of a decorated name, a mana symbol), yet it
+    /// can exactly match a 1-2 letter card name such as "X". Such slots are
+    /// sent to review. This only ever makes the SPEC accept rule stricter.
+    fn match_line(&self, line: OcrLine) -> Read {
+        let mut m = self.index.match_raw(&line.text);
+        if let Some(stripped) = strip_mana_token(&line.text) {
+            let alt = self.index.match_raw(stripped);
+            if alt.best_score() > m.best_score() {
+                m = alt;
+            }
+        }
+        if m.status == MatchStatus::Auto && m.key.chars().filter(|c| *c != ' ').count() < MIN_AUTO_CHARS {
+            m.status = MatchStatus::Review;
+        }
+        Read { m, line }
     }
 
     /// The crop handed to OCR for slot `i`: the slot band (widened by
-    /// `slot_pad_mm`), tightened vertically around the name text so the
-    /// letters fill the OCR model's input height, then optionally CLAHE'd.
-    fn slot_crop(&self, photo: &GrayImage, g: &ColumnGeometry, i: usize) -> GrayImage {
-        let band = geometry::slot_box_mm(i, self.params.slot_pad_mm);
+    /// `slot_pad_mm` and moved down by the predicted drift `shift_mm`),
+    /// tightened vertically around the name text so the letters fill the OCR
+    /// model's input height, cut after the name, then optionally CLAHE'd.
+    /// `variant` picks fallbacks for a second attempt. Also returns where the
+    /// text line was found, in mm relative to its nominal (undrifted) place.
+    fn slot_crop(
+        &self,
+        photo: &GrayImage,
+        g: &ColumnGeometry,
+        i: usize,
+        shift_mm: f64,
+        variant: CropVariant,
+    ) -> Option<(GrayImage, f64)> {
+        let nominal = geometry::slot_box_mm(i, self.params.slot_pad_mm);
+        let band = Rect { y0: nominal.y0 + shift_mm, y1: nominal.y1 + shift_mm, ..nominal };
         let mut crop = warp_rect(photo, &g.mm_to_img, band, PX_PER_MM);
+        let card_top = geometry::HEADER_Y + geometry::SLOT_PITCH * (i as f64 - 1.0);
+        let mut offset = shift_mm;
         if let Some(h) = self.params.text_height_mm {
-            let card_top = geometry::HEADER_Y + geometry::SLOT_PITCH * (i as f64 - 1.0);
-            let (y0, y1) = text_rows(&crop, band.y0, card_top, h);
-            crop = image::imageops::crop_imm(&crop, 0, y0, crop.width(), y1 - y0).to_image();
+            let lines = text_rows(&crop, band.y0, card_top + shift_mm, h);
+            let line = match variant {
+                CropVariant::SecondLine => *lines.get(1)?,
+                _ => lines[0],
+            };
+            offset = line.center_mm - (card_top + TEXT_CENTER_BELOW_TOP);
+            crop = image::imageops::crop_imm(&crop, 0, line.y0, crop.width(), line.y1 - line.y0).to_image();
+        } else if variant == CropVariant::SecondLine {
+            return None;
         }
-        if self.params.trim_right {
+        if self.params.trim_right && variant != CropVariant::Untrimmed {
             let x1 = text_right_end(&crop);
             crop = image::imageops::crop_imm(&crop, 0, 0, x1, crop.height()).to_image();
+        } else if variant == CropVariant::Untrimmed && !self.params.trim_right {
+            return None;
         }
         if let Some(clip) = self.params.clahe_clip {
             crop = clahe(&crop, self.params.clahe_tiles.0, self.params.clahe_tiles.1, clip);
         }
-        crop
+        if variant == CropVariant::Inverted {
+            crop = invert(&crop);
+        }
+        Some((crop, offset))
     }
 }
+
+/// One slot's OCR input.
+pub struct SlotCrop {
+    pub column: usize,
+    pub slot: usize,
+    /// Drift correction (mm, down the column) used for this slot.
+    pub shift_mm: f64,
+    pub image: GrayImage,
+}
+
+/// Predict the drift (mm) of the next slot's name line from the offsets
+/// measured on the slots above it: a straight-line fit through the last few
+/// offsets, ignoring outliers (a mis-located line, or a card placed 2 mm off).
+pub fn predict_shift(offsets: &[f64]) -> f64 {
+    const WINDOW: usize = 8;
+    const OUTLIER_MM: f64 = 2.5;
+    let start = offsets.len().saturating_sub(WINDOW);
+    let recent: Vec<(f64, f64)> = offsets[start..].iter().enumerate().map(|(k, &o)| (k as f64, o)).collect();
+    if recent.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = recent.iter().map(|&(_, o)| o).collect();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let inliers: Vec<(f64, f64)> = recent.into_iter().filter(|&(_, o)| (o - median).abs() <= OUTLIER_MM).collect();
+    if inliers.len() < 4 {
+        // Too few points for a trend: just follow the median offset.
+        return median;
+    }
+    // Least-squares line o = a + b * k, evaluated at the next index.
+    let n = inliers.len() as f64;
+    let (sk, so) = inliers.iter().fold((0.0, 0.0), |(sk, so), &(k, o)| (sk + k, so + o));
+    let (mk, mo) = (sk / n, so / n);
+    let (sxy, sxx) = inliers.iter().fold((0.0, 0.0), |(sxy, sxx), &(k, o)| (sxy + (k - mk) * (o - mo), sxx + (k - mk).powi(2)));
+    let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let next = (offsets.len() - start) as f64;
+    (mo + slope * (next - mk)).clamp(median - OUTLIER_MM, median + OUTLIER_MM)
+}
+
+/// Which crop of a slot to read. `Primary` is always tried; the others are
+/// fallbacks for slots whose first reading did not auto-accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CropVariant {
+    Primary,
+    /// The primary crop inverted (white text on a dark name bar).
+    Inverted,
+    /// The second-best text line (e.g. when an ornate frame out-scored the name).
+    SecondLine,
+    /// The primary line without cutting off the right-hand side.
+    Untrimmed,
+}
+
+/// `text` without its last token if that token looks like a mana cost read
+/// as text: only digits, `X` and the colour letters `WUBRGC`, at least two
+/// characters long, with a digit or only upper-case letters.
+fn strip_mana_token(text: &str) -> Option<&str> {
+    let trimmed = text.trim_end();
+    let (head, last) = trimmed.rsplit_once(char::is_whitespace)?;
+    let manaish = last.len() >= 2
+        && last.chars().all(|c| c.is_ascii_digit() || "XWUBRGC{}".contains(c))
+        && (last.chars().any(|c| c.is_ascii_digit()) || last.chars().all(|c| c.is_ascii_uppercase()));
+    (manaish && !head.trim().is_empty()).then_some(head)
+}
+
+/// See [`Scanner::match_line`].
+const MIN_AUTO_CHARS: usize = 3;
 
 /// Name-bar text centre, nominally this far below a card's top edge (mm).
 const TEXT_CENTER_BELOW_TOP: f64 = 5.4;
@@ -273,12 +420,23 @@ const TEXT_SEARCH_MM: f64 = 2.5;
 /// Height (mm) of the window scored for text energy.
 const TEXT_CORE_MM: f64 = 3.0;
 
+/// A located text line inside a slot band image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextLine {
+    /// Rows `y0..y1` of the band image to crop.
+    y0: u32,
+    y1: u32,
+    /// Strip-mm position of the line's centre.
+    center_mm: f64,
+}
+
 /// Find the rows of a slot band image (whose first row is at `band_y0` mm)
-/// that hold the name text: the window with the most horizontal-gradient
-/// energy (text strokes are mostly vertical edges), searched around the
-/// nominal text position of a card whose top edge is at `card_top` mm.
-/// Returns `height_mm` worth of rows centred on it.
-fn text_rows(band: &GrayImage, band_y0: f64, card_top: f64, height_mm: f64) -> (u32, u32) {
+/// that hold the name text: windows with the most horizontal-gradient energy
+/// (text strokes are mostly vertical edges), searched around the nominal text
+/// position of a card whose top edge is at `card_top` mm. Returns the best
+/// window and, if there is one, the best other local peak at least 2 mm away,
+/// each as `height_mm` worth of rows.
+fn text_rows(band: &GrayImage, band_y0: f64, card_top: f64, height_mm: f64) -> Vec<TextLine> {
     let (w, h) = band.dimensions();
     let raw = band.as_raw();
     // Prefix sums of per-row energy sum(|I(x+1) - I(x)|) make every window O(1).
@@ -292,25 +450,34 @@ fn text_rows(band: &GrayImage, band_y0: f64, card_top: f64, height_mm: f64) -> (
     let core_half = (TEXT_CORE_MM / 2.0 * PX_PER_MM) as i64;
     let nominal = card_top + TEXT_CENTER_BELOW_TOP;
     let clamp_row = |r: i64| r.clamp(0, h as i64) as usize;
-    let mut best = (to_row(nominal), f64::MIN);
-    for c in to_row(nominal - TEXT_SEARCH_MM)..=to_row(nominal + TEXT_SEARCH_MM) {
-        let e = prefix[clamp_row(c + core_half)] - prefix[clamp_row(c - core_half)];
-        if e > best.1 {
-            best = (c, e);
-        }
-    }
+    let centres: Vec<i64> = (to_row(nominal - TEXT_SEARCH_MM)..=to_row(nominal + TEXT_SEARCH_MM)).collect();
+    let energy: Vec<f64> =
+        centres.iter().map(|&c| prefix[clamp_row(c + core_half)] - prefix[clamp_row(c - core_half)]).collect();
+    let best = (0..centres.len()).max_by(|&a, &b| energy[a].total_cmp(&energy[b])).unwrap_or(0);
+    // A local maximum (not just the slope next to the best peak).
+    let min_sep = (2.0 * PX_PER_MM) as i64;
+    let second = (1..centres.len().saturating_sub(1))
+        .filter(|&k| (centres[k] - centres[best]).abs() >= min_sep)
+        .filter(|&k| energy[k] >= energy[k - 1] && energy[k] >= energy[k + 1])
+        .max_by(|&a, &b| energy[a].total_cmp(&energy[b]));
     let half = (height_mm / 2.0 * PX_PER_MM) as i64;
-    let y0 = (best.0 - half).clamp(0, h as i64 - 1) as u32;
-    let y1 = (best.0 + half).clamp(y0 as i64 + 1, h as i64) as u32;
-    (y0, y1)
+    let window = |c: i64| {
+        let y0 = (c - half).clamp(0, h as i64 - 1) as u32;
+        let y1 = (c + half).clamp(y0 as i64 + 1, h as i64) as u32;
+        TextLine { y0, y1, center_mm: band_y0 + c as f64 / PX_PER_MM }
+    };
+    std::iter::once(best).chain(second).map(|k| window(centres[k])).collect()
 }
 
 /// Minimum blank run (mm) that separates the name from the mana cost.
 const NAME_GAP_MM: f64 = 3.5;
+/// The mana cost occupies at most this much (mm) at the right of the bar.
+const MANA_ZONE_MM: f64 = 22.0;
 
-/// Right edge (pixel column) of the name text in a crop: the name is
-/// left-aligned, so we walk right from the first inked column and stop at the
-/// first blank run of at least `NAME_GAP_MM`. If there is no such gap the full
+/// Right edge (pixel column) of the name text in a crop. Walking in from the
+/// right, we look for a blank run of at least `NAME_GAP_MM` that starts
+/// within the rightmost `MANA_ZONE_MM` (anything right of it is the mana cost
+/// or nothing) and cut just left of it. If there is no such gap the full
 /// width is kept, so a long name is never cut.
 fn text_right_end(crop: &GrayImage) -> u32 {
     let (w, h) = crop.dimensions();
@@ -340,17 +507,28 @@ fn text_right_end(crop: &GrayImage) -> u32 {
     }
     let threshold = floor + 0.2 * (peak - floor);
     let gap = (NAME_GAP_MM * PX_PER_MM) as usize;
+    let zone_start = (w as f64 - MANA_ZONE_MM * PX_PER_MM).max(0.0) as usize;
     let margin = PX_PER_MM as usize; // keep 1 mm after the last letter
-    let Some(start) = smooth.iter().position(|&e| e > threshold) else { return w };
-    let mut blank_run = 0;
-    for x in start..smooth.len() {
-        if smooth[x] > threshold {
-            blank_run = 0;
+    // Walk leftwards; `run_end` is the right end of the current blank run.
+    let mut run_end: Option<usize> = None;
+    for x in (0..smooth.len()).rev() {
+        if smooth[x] <= threshold {
+            let end = *run_end.get_or_insert(x);
+            if end - x + 1 >= gap && end >= zone_start {
+                // Found the gap; extend it to its left end, then cut there.
+                let mut left = x;
+                while left > 0 && smooth[left - 1] <= threshold {
+                    left -= 1;
+                }
+                if left == 0 {
+                    return w; // nothing inked at all: keep everything
+                }
+                return ((left + margin).min(w as usize) as u32).max(1);
+            }
         } else {
-            blank_run += 1;
-            if blank_run >= gap {
-                let end = x + 1 - blank_run;
-                return ((end + margin).min(w as usize) as u32).max(1);
+            run_end = None;
+            if x < zone_start {
+                return w; // ink continues past the mana zone: a long name
             }
         }
     }
@@ -460,6 +638,45 @@ mod tests {
     use image::Luma;
 
     #[test]
+    fn drift_prediction_follows_a_trend_and_ignores_outliers() {
+        assert_eq!(predict_shift(&[]), 0.0);
+        // Drift growing by 0.5 mm per slot, plus one mis-located line.
+        let offsets = [0.0, 0.5, 1.0, 9.0, 2.0, 2.5, 3.0];
+        let p = predict_shift(&offsets);
+        assert!((p - 3.5).abs() < 0.3, "{p}");
+    }
+
+    #[test]
+    fn mana_tokens() {
+        assert_eq!(strip_mana_token("Dig Through Time 6UU"), Some("Dig Through Time"));
+        assert_eq!(strip_mana_token("Shivan Dragon 4RR"), Some("Shivan Dragon"));
+        assert_eq!(strip_mana_token("Serra Angel"), None);
+        assert_eq!(strip_mana_token("Fire // Ice"), None);
+        assert_eq!(strip_mana_token("Ponder U"), None);
+        assert_eq!(strip_mana_token("6UU"), None);
+    }
+
+    #[test]
+    fn right_trim_cuts_before_mana_cost() {
+        // 61 mm wide: "name" ink 2..20 mm, mana symbols 55..60 mm.
+        let w = (61.0 * PX_PER_MM) as u32;
+        let crop = GrayImage::from_fn(w, 60, |x, y| {
+            let mm = x as f64 / PX_PER_MM;
+            let inked = (2.0..20.0).contains(&mm) || (55.0..60.0).contains(&mm);
+            Luma([if inked && (x + y) % 3 == 0 { 20 } else { 220 }])
+        });
+        let end = text_right_end(&crop) as f64 / PX_PER_MM;
+        assert!((20.0..22.5).contains(&end), "cut at {end} mm");
+        // A long name running into the mana zone is not cut.
+        let long = GrayImage::from_fn(w, 60, |x, y| {
+            let mm = x as f64 / PX_PER_MM;
+            let inked = (2.0..53.0).contains(&mm) || (55.0..60.0).contains(&mm);
+            Luma([if inked && (x + y) % 3 == 0 { 20 } else { 220 }])
+        });
+        assert_eq!(text_right_end(&long), w);
+    }
+
+    #[test]
     fn text_rows_finds_the_textured_band() {
         // A 144-row band starting at 24 mm (card top 25 mm): plain except for
         // a striped "text" band centred at 31 mm (row 84).
@@ -467,8 +684,10 @@ mod tests {
             let textured = (66..102).contains(&y) && x % 4 < 2;
             Luma([if textured { 30 } else { 200 }])
         });
-        let (y0, y1) = text_rows(&band, 24.0, 25.0, 6.0);
+        let line = text_rows(&band, 24.0, 25.0, 6.0)[0];
+        let (y0, y1) = (line.y0, line.y1);
         let centre = (y0 + y1) / 2;
+        assert!((line.center_mm - 31.0).abs() < 0.2);
         assert!((82..=86).contains(&centre), "centre row {centre}");
         assert_eq!(y1 - y0, 72);
     }
