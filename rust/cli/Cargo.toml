@@ -1,0 +1,16 @@
+[package]
+name = "fscan-cli"
+description = "Desktop CLI for card-fscan: `fscan scan --out <dir> <image>...`"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "fscan"
+path = "src/main.rs"
+
+[dependencies]
+fscan-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+image.workspace = true

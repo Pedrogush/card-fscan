@@ -1,0 +1,8 @@
+target/
+results/
+models/*.onnx
+models/*.rten
+android/assets/
+*.apk
+*.keystore
+*.jks

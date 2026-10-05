@@ -1,0 +1,37 @@
+# Cargo *workspace*: several crates that share one Cargo.lock and one target/ dir.
+[workspace]
+resolver = "3"
+members = ["core", "cli"]
+# `cargo build`/`cargo test` without -p only touch these; the Android crate
+# is built with cargo-ndk (see README).
+default-members = ["core", "cli"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Pedrogush/card-fscan"
+version = "0.1.0"
+
+# Versions are pinned once here and inherited with `dep.workspace = true`.
+[workspace.dependencies]
+fscan-core = { path = "core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+imageproc = { version = "0.25", default-features = false }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+unicode-normalization = "0.1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rten = { version = "0.27", default-features = false, features = ["onnx_format"] }
+rten-tensor = "0.27"
+rayon = "1"
+
+[profile.release]
+debug = "line-tables-only"
+
+# Image decoding and the OCR model are painfully slow without optimisation,
+# so even debug/test builds optimise dependencies.
+[profile.dev.package."*"]
+opt-level = 3
