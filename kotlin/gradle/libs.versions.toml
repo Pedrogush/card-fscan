@@ -8,8 +8,9 @@ opencvDesktop = "4.9.0-0"   # org.openpnp: OpenCV Java API + natives for Win/Lin
 opencvAndroid = "4.12.0"    # official OpenCV Android AAR (same Java API)
 onnxruntime = "1.30.0"
 junit = "6.1.3"
-composeBom = "2026.09.00"
+composeBom = "2026.06.01"   # newest BOM whose libraries still compile against API 36
 activityCompose = "1.13.0"
+lifecycle = "2.10.0"
 
 [libraries]
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
@@ -25,6 +26,8 @@ compose-material3 = { module = "androidx.compose.material3:material3" }
 compose-ui = { module = "androidx.compose.ui:ui" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
