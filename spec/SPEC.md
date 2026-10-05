@@ -75,7 +75,12 @@ The name index is `testdata/names/names_v1.json` (built by
 ```
 
 For split / adventure / double-faced cards, every face name AND the full
-`A // B` name get their own entries with the same `oracle_id`.
+`A // B` name get their own entries with the same `oracle_id`. Exception
+(tools v1): the secondary face of `adventure` and `prepare` layouts is not
+indexed by its face name (that name is printed in the text box, never on the
+name bar, and often reuses a classic name such as "Lightning Bolt"). Some keys
+still map to several oracle_ids (un-set variants, shared PT translations);
+such names can only ever be `review`.
 
 `normalize(s)`:
 1. Unicode NFKD, drop combining marks (so `ã` -> `a`, `ç` -> `c`).
@@ -86,7 +91,11 @@ For split / adventure / double-faced cards, every face name AND the full
 
 Cleaning OCR text before normalising: strip trailing tokens that contain no
 letters (mana cost residue), and strip any trailing run of chars from the set
-`{}()[]0123456789@#*%&+=|\/` and whitespace.
+`{}()[]0123456789@#*%&+=|\/` and whitespace. Precisely (clarified, tools v1):
+split on whitespace; while the last token contains no letter (Unicode
+alphabetic), drop it; re-join with single spaces; then strip trailing chars
+from the set or whitespace. `"Lightning Bolt {R}"` cleans to
+`"Lightning Bolt {R"` (the token contains a letter), which still matches.
 
 Score: `ratio(a, b) = 100 * (1 - indel(a, b) / (len(a) + len(b)))`, where
 `indel` is the insert/delete-only edit distance (this equals
@@ -97,6 +106,14 @@ Auto-accept when: best >= 90 AND best - runner_up >= 5 (runner-up = best score
 of a *different* oracle_id), AND if `len(best.key) <= 6` then best >= 95.
 Otherwise the slot is `review`. A crop with no OCR text (or only non-letters)
 is `empty`.
+
+Determinism details (clarified, tools v1): compare thresholds with a 1e-6
+tolerance (`best >= 90 - 1e-6` etc.) so float rounding cannot flip a
+boundary case. Within one oracle_id, `name`/`lang` come from the first entry
+(in index file order) that reaches that oracle_id's best score. Candidates are
+ordered by score descending, then oracle_id ascending. The executable
+reference is `tools/reference_match.py`; `testdata/names/match_cases.json`
+holds test vectors generated from it (scores rounded to 2 decimals).
 
 ## 4. Output JSON (one per photo)
 
