@@ -1,0 +1,29 @@
+[package]
+name = "fscan-android"
+description = "card-fscan Android app (NativeActivity + egui), Rust-only"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+name = "fscan_android"
+# Android loads the app as a shared library (libfscan_android.so) via
+# NativeActivity; "lib" lets the host `cargo check`/`cargo test` it too.
+crate-type = ["cdylib", "lib"]
+
+# Host-side (portable) deps: the scan/report logic in src/scan.rs.
+[dependencies]
+fscan-core.workspace = true
+image.workspace = true
+
+# Android-only deps. On Windows/Linux hosts none of this is compiled.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "android-native-activity",
+] }
+winit = { version = "0.30.13", default-features = false }
+android_logger = "0.15"
+log = "0.4"

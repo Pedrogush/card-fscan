@@ -1,7 +1,7 @@
 # Cargo *workspace*: several crates that share one Cargo.lock and one target/ dir.
 [workspace]
 resolver = "3"
-members = ["core", "cli"]
+members = ["core", "cli", "android"]
 # `cargo build`/`cargo test` without -p only touch these; the Android crate
 # is built with cargo-ndk (see README).
 default-members = ["core", "cli"]
@@ -24,7 +24,7 @@ imageproc = { version = "0.25", default-features = false }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 unicode-normalization = "0.1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-rten = { version = "0.27", default-features = false, features = ["onnx_format"] }
+rten = { version = "0.27", default-features = false, features = ["onnx_format", "rten_format"] }
 rten-tensor = "0.27"
 rayon = "1"
 
