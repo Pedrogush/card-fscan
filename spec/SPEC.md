@@ -42,6 +42,22 @@ within about +/- 2 mm of the tick line.
 
 Configs: C4 = columns 1..4 (ids 0..7), C6 = columns 1..6 (ids 0..11).
 
+### 1b. Rack variant (fab/ v2)
+
+Printed racks (`fab/`) replace the flat paper strips. They keep every number above as seen from the
+camera, so the pipeline contract (section 2) is unchanged:
+
+- Rack width = column pitch = 70. Rack front edge = strip y 0. A 64 x 24.5 header plate (strip x 3..67,
+  y 0..24.5) carries a sticker (`fab/header_stickers.svg`) with the markers at the section 1 positions.
+- Cards stand in grooves tilted 20 degrees from the board, card i's top edge at strip y 25 + 10(i-1).
+  Projected straight down, each card still shows a 10 mm band, so the slot grid is unchanged.
+- The marker plane and every card's top edge are coplanar (33.4 mm above the board). Name text lies
+  up to about 3.6 mm *below* that plane, so it is displaced towards the image centre by up to
+  depth x (radial distance / lens height), about 2.5 mm at C6 frame corners. Slot crops must tolerate
+  this (the section 2 step 5 widening, or text-line finding inside the slot).
+- Between columns, 6 mm of rack wall (3 mm per rack) is visible; it lies outside the slot crop x range.
+- Lens heights are measured from the marker plane, not the board.
+
 ## 2. Pipeline contract
 
 1. Detect DICT_4X4_50 markers in the whole photo.
