@@ -241,3 +241,63 @@ a `cdylib` (a C-style `.so`), and `#[cfg(target_os = "android")]` code plus
 (`android/src/lib.rs`) — no Java needed. `build_apk.ps1` then does what
 Gradle would: `aapt2` for the manifest/assets, zip in the `.so`, `zipalign`,
 `apksigner`.
+
+## Profiling and performance in Rust (as used in this code)
+
+Phase 2 numbers and the full story are in [`PERF.md`](PERF.md). The tools
+and patterns:
+
+**Release profiles.** `cargo build --release` turns on the optimiser; the
+OCR model is ~30x slower without it. `Cargo.toml` sets
+`[profile.release] debug = "line-tables-only"` (fast code that still gives
+file:line in panics and profilers) and `[profile.dev.package."*"]
+opt-level = 3`, so even `cargo test` builds optimise the heavy dependencies
+while our own crates stay quick to compile. Always time release builds.
+
+**Timing with `Instant`.** `std::time::Instant::now()` / `.elapsed()` is a
+monotonic clock costing tens of nanoseconds, cheap enough to leave in. The
+`profile` module (`core/src/profile.rs`) wraps it: `prof.time(Stage::Warp,
+|| warp_rect(...))` runs a closure and charges its duration to a stage.
+Stages are counted in `AtomicU64`s so rayon worker threads can add to the
+same `Profile` without a lock (`fetch_add` with `Ordering::Relaxed`: we only
+need the final sums, not ordering between threads). `fscan bench --reps N`
+(`cli/src/main.rs`) prints mean / p50 / p95 / share per stage, and every
+JSON carries the breakdown in `timing_ms`.
+
+**Wall time vs CPU time.** On a busy machine wall-clock time is noise.
+`cli/src/cpu.rs` reads the process CPU time (a two-function FFI declaration of
+`GetProcessTimes` on Windows, `/proc/self/stat` on Linux/Android), which
+measures *work* and barely moves when other programs compete for the cores.
+Optimise work first, then parallelism.
+
+**Parallelism.** `rayon` turns `iter()` into `par_iter()` for independent
+work (slot crops per column, matching). For the OCR model, rten would
+otherwise split each layer over all cores, but this model's layers are too
+small to split well, and it degrades badly under load. Instead
+`ocr::run_on_workers` starts one scoped thread per core
+(`std::thread::scope`, so they may borrow the crops) that pull whole batches
+from an `AtomicUsize` counter, and each batch runs single-threaded on a
+per-thread rten pool (`thread_local!`). We avoided rayon there on purpose:
+a rayon thread that blocks inside another pool keeps stealing work, so far
+more model runs than cores were in flight.
+
+**Doing less work.** The biggest wins were algorithmic, not
+micro-optimisation: a small fast model reads every slot and the accurate
+one only re-reads the doubtful ones (`Scanner::scan`, pass 1b); fallback
+crops run as a cascade that stops as soon as a slot is accepted and skips
+variants that would duplicate the primary crop (`slot_crop`); the JPEG
+decoder is asked for the luma plane only (`pipeline::decode_gray`).
+
+**Allocation and memory layout.**
+- `std::mem::take(&mut crop.image)` moves an image out of a struct (leaving
+  an empty one) instead of `clone()`-ing ~50 KB per slot (`Scanner::scan`).
+- `warp_rect` (`core/src/image_ops.rs`) allocates the output once and writes
+  rows through `chunks_exact_mut` instead of a bounds-checked `put_pixel` per
+  pixel, and steps the projective coordinates incrementally.
+- `Vec::with_capacity` when the final size is known.
+- Data-oriented layout in `NameIndex`: the 62k keys live back to back in one
+  `Vec<u8>` grouped by oracle id ("struct of arrays"), so a query streams
+  through memory instead of chasing one heap pointer per `String`; this
+  halved the matching time. A length-based pruning we tried first was
+  *slower*: it barely pruned and it scattered the memory accesses. Measure
+  (`core/examples/match_bench.rs`), don't guess.

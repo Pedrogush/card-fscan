@@ -66,10 +66,10 @@ fn shared_match_cases() {
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// The length-pruned search must return exactly what scoring every entry
-/// returns: same oracle ids, names and scores, in the same order.
+/// The flat-layout search must return exactly what the straightforward
+/// per-`String` search returns: same oracle ids, names and scores, in order.
 #[test]
-fn pruned_search_equals_exhaustive() {
+fn flat_search_equals_reference() {
     use fscan_core::matching::normalize;
     let root = repo_root();
     let index = NameIndex::load(&root.join("testdata/names/names_v1.json")).expect("load names_v1.json");

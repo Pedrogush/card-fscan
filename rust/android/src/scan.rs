@@ -21,6 +21,9 @@ pub struct ScanInputs {
     pub model: Vec<u8>,
     /// `rec.dict.txt` (character dictionary for the model).
     pub dict: String,
+    /// Optional fast first-pass model and its dictionary (`fast.onnx`,
+    /// `fast.dict.txt`); see `Scanner::fast_recognizer`.
+    pub fast: Option<(Vec<u8>, String)>,
     /// JPEG/PNG bytes of the photo and a display name for it.
     pub photo: Vec<u8>,
     pub photo_name: String,
@@ -40,7 +43,12 @@ pub fn run(inputs: ScanInputs) -> Result<String, String> {
     let rec = RtenRecognizer::from_bytes(inputs.model, Some(&inputs.dict))
         .map_err(|e| format!("loading OCR model failed: {e}"))?;
     let _ = writeln!(out, "OCR model loaded ({} ms)", t.elapsed().as_millis());
-    let scanner = Scanner::new(index, Box::new(rec));
+    let mut scanner = Scanner::new(index, Box::new(rec));
+    if let Some((model, dict)) = inputs.fast {
+        let fast = RtenRecognizer::from_bytes(model, Some(&dict))
+            .map_err(|e| format!("loading fast OCR model failed: {e}"))?;
+        scanner.fast_recognizer = Some(Box::new(fast));
+    }
 
     let t = Instant::now();
     let gray = image::load_from_memory(&inputs.photo)

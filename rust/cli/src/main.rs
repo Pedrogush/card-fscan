@@ -4,6 +4,7 @@
 //! fscan scan  --out <dir> [options] <image>...     one JSON per photo (SPEC §5)
 //! fscan bench [--reps N] [--out <dir>] [options] <image>...   per-stage timing table
 //! options: --names <names_v1.json[.gz]>  --model <rec model>  --dump-crops <dir>
+//!          --fast-model <rec model> (default: PP-OCRv6 tiny)  --no-fast (accurate model only)
 //!          --ocr-batch N  --intra-op (rten's own threading, the Phase 1 behaviour)
 //! ```
 
@@ -54,7 +55,7 @@ fn parse_args() -> Result<Args> {
         out: None,
         names: root.join("testdata/names/names_v1.json"),
         model: root.join("rust/models/en_PP-OCRv5_rec_mobile.onnx"),
-        fast_model: None,
+        fast_model: Some(root.join("rust/models/PP-OCRv6_rec_tiny.onnx")),
         dump: None,
         reps: 3,
         ocr_batch: None,
@@ -70,6 +71,7 @@ fn parse_args() -> Result<Args> {
             "--names" => parsed.names = PathBuf::from(value()?),
             "--model" => parsed.model = PathBuf::from(value()?),
             "--fast-model" => parsed.fast_model = Some(PathBuf::from(value()?)),
+            "--no-fast" => parsed.fast_model = None,
             "--dump-crops" => parsed.dump = Some(PathBuf::from(value()?)),
             "--ocr-batch" => parsed.ocr_batch = Some(value()?.parse().context("--ocr-batch needs a number")?),
             "--intra-op" => parsed.intra_op = true,

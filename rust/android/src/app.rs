@@ -171,5 +171,13 @@ fn load_inputs(app: &AndroidApp) -> Result<ScanInputs, String> {
     let model = require_asset(app, "rec.onnx")?;
     let dict = String::from_utf8(require_asset(app, "rec.dict.txt")?)
         .map_err(|e| format!("rec.dict.txt is not UTF-8: {e}"))?;
-    Ok(ScanInputs { names_gz, model, dict, photo, photo_name })
+    // The fast first-pass model is optional: without it the app still works,
+    // just slower.
+    let fast = match (read_asset(app, "fast.onnx")?, read_asset(app, "fast.dict.txt")?) {
+        (Some(m), Some(d)) => {
+            Some((m, String::from_utf8(d).map_err(|e| format!("fast.dict.txt is not UTF-8: {e}"))?))
+        }
+        _ => None,
+    };
+    Ok(ScanInputs { names_gz, model, dict, fast, photo, photo_name })
 }

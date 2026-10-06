@@ -8,6 +8,7 @@ free distribution of the APK. No GPL/AGPL code is linked.
 | File | Source | License |
 | --- | --- | --- |
 | `en_PP-OCRv4_rec_mobile.onnx` (+ `.dict.txt`) | PaddleOCR PP-OCRv4 English recognition model, ONNX export from RapidOCR (`modelscope.cn/models/RapidAI/RapidOCR`, `onnx/PP-OCRv4/rec/`) | Apache-2.0 (PaddlePaddle/PaddleOCR, RapidAI/RapidOCR) |
+| `PP-OCRv6_rec_tiny.onnx` (+ `.dict.txt`), fast first-pass reader | PaddleOCR PP-OCRv6 tiny recognition model (1.1M parameters), ONNX export from RapidOCR (`onnx/PP-OCRv6/rec/`) | Apache-2.0 (PaddlePaddle/PaddleOCR, RapidAI/RapidOCR) |
 | `en_PP-OCRv5_rec_mobile.onnx`, `latin_PP-OCRv5_rec_mobile.onnx` (bake-off only) | same, `onnx/PP-OCRv5/rec/` | Apache-2.0 |
 | `text-recognition.rten` (bake-off only) | `ocrs` recognition model, `ocrs-models.s3-accelerate.amazonaws.com` | MIT/Apache-2.0 (robertknight/ocrs) |
 

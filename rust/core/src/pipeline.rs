@@ -12,7 +12,7 @@ use crate::aruco::{self, DetectorParams, Marker};
 use crate::geometry::{self, CARDS_PER_COLUMN, PX_PER_MM, Point, Rect, STOP_CARD_ID, STRIP_W, Side};
 use crate::homography::Homography;
 use crate::image_ops::{clahe, invert, warp_rect};
-use crate::matching::{MatchResult, MatchStatus, NameIndex};
+use crate::matching::{EPS, MatchResult, MatchStatus, NameIndex};
 use crate::ocr::{OcrLine, Recognizer};
 use crate::output::*;
 use crate::profile::{Count, Profile, Stage, ms_since};
@@ -212,30 +212,49 @@ impl Scanner {
         let mut reads = self.match_all(lines, &prof);
         timing.match_ = ms_since(t_match);
 
-        // Pass 1b (reader cascade): the accurate model re-reads what the fast
-        // one could not auto-accept; the better match wins.
+        // Pass 1b (reader cascade): the accurate model re-reads every slot the
+        // fast one did not auto-accept convincingly. A fast-model auto is
+        // trusted when its score is >= FAST_TRUST or the text reads like a
+        // name bar (see `looks_like_name_bar`); an untrusted one is kept only
+        // if the accurate model also auto-accepts, otherwise the slot goes to
+        // review.
         if self.fast_recognizer.is_some() {
             prof.count(Count::FastLines, images.len() as u64);
-            let todo: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
+            let trusted = |r: &Read| {
+                r.m.status == MatchStatus::Auto
+                    && (r.m.best_score() >= FAST_TRUST - EPS || looks_like_name_bar(&r.line.text))
+            };
+            let todo: Vec<usize> = (0..reads.len()).filter(|&k| !trusted(&reads[k])).collect();
             let sub: Vec<GrayImage> = todo.iter().map(|&k| images[k].clone()).collect();
             let t_ocr = Instant::now();
             let lines = self.recognizer.recognize(&sub, &prof)?;
             timing.ocr += ms_since(t_ocr);
             let t_match = Instant::now();
-            for (k, alt) in todo.into_iter().zip(self.match_all(lines, &prof)) {
-                if alt.better_than(&reads[k]) {
-                    reads[k] = alt;
+            for (k, accurate) in todo.into_iter().zip(self.match_all(lines, &prof)) {
+                let fast_auto = reads[k].m.status == MatchStatus::Auto;
+                if accurate.m.status == MatchStatus::Auto {
+                    reads[k] = accurate;
+                } else {
+                    if accurate.better_than(&reads[k]) {
+                        reads[k] = accurate;
+                    }
+                    if fast_auto {
+                        // Unconfirmed fast-model auto: send it to review.
+                        reads[k].m.status = MatchStatus::Review;
+                    }
                 }
             }
             timing.match_ += ms_since(t_match);
         }
 
-        // Pass 2: slots that didn't auto-accept get more attempts, as a
-        // cascade: one fallback crop variant per round, and only for slots
-        // still not auto-accepted. A variant is skipped when it would just
-        // repeat the primary crop (see `slot_crop`). Per round, the
-        // better-scoring reading wins.
-        let mut pending: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
+        // Pass 2: slots that still aren't auto-accepted get one more round
+        // with fallback crops: the untrimmed line (only if the mana-cost trim
+        // cut something), the second-best text line (if there is one) and
+        // the inverted crop (white-on-dark name bars). All of them go into a
+        // single OCR call so the cores stay busy; the best-scoring reading
+        // wins. (A cascade that stopped at the first auto-accept ran three
+        // small rounds back to back and saved little: rescues are rare.)
+        let pending: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
         if !pending.is_empty() {
             let t_retry = Instant::now();
             prof.count(Count::RetrySlots, pending.len() as u64);
@@ -245,34 +264,32 @@ impl Scanner {
             if self.params.try_inverted {
                 variants.push(CropVariant::Inverted);
             }
-            for v in variants {
-                if pending.is_empty() {
-                    break;
-                }
-                let t_crop = Instant::now();
-                // (read index, crop) for every slot where this variant exists.
-                let jobs: Vec<(usize, GrayImage)> = pending
-                    .par_iter()
-                    .filter_map(|&k| {
-                        let c = &crops[k];
-                        self.slot_crop(photo, geometry_of(c.column), c.slot, c.shift_mm, v, &prof).map(|(img, _)| (k, img))
+            let t_crop = Instant::now();
+            // (read index, crop) for every fallback crop that exists.
+            let jobs: Vec<(usize, GrayImage)> = pending
+                .par_iter()
+                .flat_map_iter(|&k| {
+                    let c = &crops[k];
+                    let g = geometry_of(c.column);
+                    let prof = &prof;
+                    variants.iter().filter_map(move |&v| {
+                        self.slot_crop(photo, g, c.slot, c.shift_mm, v, prof).map(|(img, _)| (k, img))
                     })
-                    .collect();
-                timing.crop += ms_since(t_crop);
-                prof.count(Count::RetryCrops, jobs.len() as u64);
-                let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
-                let t_ocr = Instant::now();
-                let lines = self.recognizer.recognize(&extra, &prof)?;
-                timing.ocr += ms_since(t_ocr);
-                let t_match = Instant::now();
-                for (k, alt) in owners.into_iter().zip(self.match_all(lines, &prof)) {
-                    if alt.better_than(&reads[k]) {
-                        reads[k] = alt;
-                    }
+                })
+                .collect();
+            timing.crop += ms_since(t_crop);
+            prof.count(Count::RetryCrops, jobs.len() as u64);
+            let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
+            let t_ocr = Instant::now();
+            let lines = self.recognizer.recognize(&extra, &prof)?;
+            timing.ocr += ms_since(t_ocr);
+            let t_match = Instant::now();
+            for (k, alt) in owners.into_iter().zip(self.match_all(lines, &prof)) {
+                if alt.better_than(&reads[k]) {
+                    reads[k] = alt;
                 }
-                timing.match_ += ms_since(t_match);
-                pending.retain(|&k| reads[k].m.status != MatchStatus::Auto);
             }
+            timing.match_ += ms_since(t_match);
             timing.retry = ms_since(t_retry);
         }
 
@@ -489,6 +506,19 @@ pub fn decode_gray(bytes: &[u8]) -> Result<(GrayImage, f64, f64), Error> {
     let t = Instant::now();
     let gray = img.into_luma8();
     Ok((gray, decode, ms_since(t)))
+}
+
+/// A fast-model auto-accept needs at least this score to skip the accurate
+/// model (see pass 1b in `Scanner::scan`).
+const FAST_TRUST: f64 = 95.0;
+
+/// Card names on name bars are printed in title case. Text that doesn't
+/// start with an upper-case letter or has no lower-case letters at all
+/// (banners, mastheads, type lines, junk around a word) is not trusted from
+/// the fast model alone. E.g. the showcase frame reading `/PROSPERITY8O0`.
+fn looks_like_name_bar(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().next().is_some_and(char::is_uppercase) && t.chars().any(char::is_lowercase)
 }
 
 /// See [`Scanner::match_line`].
@@ -725,6 +755,15 @@ mod tests {
         let offsets = [0.0, 0.5, 1.0, 9.0, 2.0, 2.5, 3.0];
         let p = predict_shift(&offsets);
         assert!((p - 3.5).abs() < 0.3, "{p}");
+    }
+
+    #[test]
+    fn name_bar_shape() {
+        assert!(looks_like_name_bar("Lightning Bolt"));
+        assert!(looks_like_name_bar("Relâmpago"));
+        assert!(!looks_like_name_bar("/PROSPERITY8O0"));
+        assert!(!looks_like_name_bar("ENCHANTMENT"));
+        assert!(!looks_like_name_bar("oço das Bruxarias"));
     }
 
     #[test]

@@ -96,6 +96,9 @@ $modelDir = $modelDirs | Where-Object { Test-Path (Join-Path $_ 'en_PP-OCRv5_rec
 if (-not $modelDir) { throw "OCR model en_PP-OCRv5_rec_mobile.onnx not found in: $($modelDirs -join ', ')" }
 Copy-Item (Join-Path $modelDir 'en_PP-OCRv5_rec_mobile.onnx') (Join-Path $AssetsDir 'rec.onnx')
 Copy-Item (Join-Path $modelDir 'en_PP-OCRv5_rec_mobile.dict.txt') (Join-Path $AssetsDir 'rec.dict.txt')
+# Fast first-pass model (PP-OCRv6 tiny); the accurate model re-reads what it can't accept.
+Copy-Item (Join-Path $modelDir 'PP-OCRv6_rec_tiny.onnx') (Join-Path $AssetsDir 'fast.onnx')
+Copy-Item (Join-Path $modelDir 'PP-OCRv6_rec_tiny.dict.txt') (Join-Path $AssetsDir 'fast.dict.txt')
 
 if ($Sample) {
     if (-not (Test-Path $Sample)) { throw "sample photo not found: $Sample" }
