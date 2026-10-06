@@ -62,7 +62,9 @@ pub struct RtenRecognizer {
     /// `alphabet[i]` is the character for class `i + 1` (class 0 is the CTC
     /// blank).
     alphabet: Vec<char>,
-    /// Lines are processed in batches of this size.
+    /// Lines are processed in batches of (at most) this size. Batching saves
+    /// little CPU for this model, and small batches balance better across
+    /// unequal cores (phones mix fast and slow cores), so the default is 4.
     pub batch_size: usize,
     /// Widest input (pixels after resizing) a line may have.
     pub max_width: u32,
@@ -158,7 +160,7 @@ impl RtenRecognizer {
             None => (ModelKind::Ocrs, OCRS_ALPHABET.chars().collect()),
         };
         let input_height = kind.input_height();
-        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 8, max_width: 640, input_height, width_scale: 1.0, threading: Threading::InterBatch })
+        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 4, max_width: 640, input_height, width_scale: 1.0, threading: Threading::InterBatch })
     }
 
     /// Number of concurrent model runs in [`Threading::InterBatch`] mode.
