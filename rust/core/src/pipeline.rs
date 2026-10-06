@@ -222,7 +222,9 @@ impl Scanner {
             prof.count(Count::FastLines, images.len() as u64);
             let trusted = |r: &Read| {
                 r.m.status == MatchStatus::Auto
-                    && (r.m.best_score() >= FAST_TRUST - EPS || looks_like_name_bar(&r.line.text))
+                    && (r.m.best_score() >= FAST_TRUST - EPS
+                        || looks_like_name_bar(&r.line.text)
+                        || (title_case_start(&r.line.text) && equal_ignoring_spaces(&r.m)))
             };
             let todo: Vec<usize> = (0..reads.len()).filter(|&k| !trusted(&reads[k])).collect();
             let sub: Vec<GrayImage> = todo.iter().map(|&k| images[k].clone()).collect();
@@ -342,10 +344,16 @@ impl Scanner {
     /// 6UU`) survive SPEC cleaning, so when the last token looks like a mana
     /// cost we also try without it and keep the better match.
     ///
-    /// A reading of fewer than `MIN_AUTO_CHARS` letters/digits is almost
-    /// always a fragment (one glyph of a decorated name, a mana symbol), yet it
-    /// can exactly match a 1-2 letter card name such as "X". Such slots are
-    /// sent to review. This only ever makes the SPEC accept rule stricter.
+    /// Two guards send otherwise-accepted slots to review; both only ever make
+    /// the SPEC accept rule stricter:
+    /// - a reading of fewer than `MIN_AUTO_CHARS` letters/digits is almost
+    ///   always a fragment (one glyph of a decorated name, a mana symbol), yet
+    ///   it can exactly match a 1-2 letter card name such as "X";
+    /// - an all-capitals reading that is either very short or matches a known
+    ///   frame decoy, e.g. the "Prosperity Post" newspaper frame read as
+    ///   `PRASPERITY` (see [`decoy_or_fragment`]);
+    /// - names that differ only by spaces ("Wasteland" / "Waste Land") are
+    ///   never auto-accepted against each other (see [`space_ambiguous`]).
     fn match_line(&self, line: OcrLine, prof: &Profile) -> Read {
         let mut m = self.index.match_raw_profiled(&line.text, prof);
         if let Some(stripped) = strip_mana_token(&line.text) {
@@ -354,7 +362,11 @@ impl Scanner {
                 m = alt;
             }
         }
-        if m.status == MatchStatus::Auto && m.key.chars().filter(|c| *c != ' ').count() < MIN_AUTO_CHARS {
+        if m.status == MatchStatus::Auto
+            && (m.key.chars().filter(|c| *c != ' ').count() < MIN_AUTO_CHARS
+                || decoy_or_fragment(&line.text, &m)
+                || space_ambiguous(&m))
+        {
             m.status = MatchStatus::Review;
         }
         Read { m, line }
@@ -516,9 +528,58 @@ const FAST_TRUST: f64 = 95.0;
 /// start with an upper-case letter or has no lower-case letters at all
 /// (banners, mastheads, type lines, junk around a word) is not trusted from
 /// the fast model alone. E.g. the showcase frame reading `/PROSPERITY8O0`.
+///
+/// It must also not switch from lower to upper case inside a word
+/// (`WasteLand`, `BalÍightning`): that is how the fast model shows a dropped
+/// space or a garbled letter, and "Wasteland" / "Waste Land" are different
+/// cards.
 fn looks_like_name_bar(text: &str) -> bool {
     let t = text.trim();
+    let camel = t.chars().zip(t.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase());
+    t.chars().next().is_some_and(char::is_uppercase) && t.chars().any(char::is_lowercase) && !camel
+}
+
+/// Starts with an upper-case letter and has lower-case letters.
+fn title_case_start(text: &str) -> bool {
+    let t = text.trim();
     t.chars().next().is_some_and(char::is_uppercase) && t.chars().any(char::is_lowercase)
+}
+
+/// The reading equals its best candidate once spaces are ignored: the fast
+/// model often drops spaces (`BelovedChaplain`), which costs a few points of
+/// score but is otherwise an exact read.
+fn equal_ignoring_spaces(m: &MatchResult) -> bool {
+    m.best().is_some_and(|b| b.key.replace(' ', "") == m.key.replace(' ', ""))
+}
+
+/// True when the two best candidates have the same name once spaces are
+/// removed ("Wasteland" vs "Waste Land"): OCR spacing is not reliable enough
+/// to tell them apart, so such a slot is never auto-accepted.
+fn space_ambiguous(m: &MatchResult) -> bool {
+    let squash = |k: &str| k.replace(' ', "");
+    match (m.candidates.first(), m.candidates.get(1)) {
+        (Some(a), Some(b)) => squash(&a.key) == squash(&b.key),
+        _ => false,
+    }
+}
+
+/// Card names that are also printed as *decoration* on other cards' name
+/// bars, in capitals: the "Breaking News" newspaper frame (Outlaws of Thunder
+/// Junction) shows the masthead "THE PROSPERITY POST" where the name usually
+/// is, on many different cards. The real "Prosperity" prints its name in
+/// title case and is unaffected. Keys as produced by `normalize`.
+const FRAME_DECOYS: &[&str] = &["prosperity"];
+
+/// An all-capitals reading (no lower-case letters) is not auto-accepted when
+/// it has fewer than 5 letters (a fragment such as `BAT`) or its best match
+/// is a known frame decoy. Legitimate all-caps name bars exist (some special
+/// frames print "CURIOSITY", "THE FOURTH DOCTOR"), so caps alone is not a
+/// reason to reject.
+fn decoy_or_fragment(text: &str, m: &MatchResult) -> bool {
+    let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+    let all_caps = !letters.is_empty() && !letters.iter().any(|c| c.is_lowercase());
+    let decoy = m.best().is_some_and(|b| FRAME_DECOYS.contains(&b.key.as_str()));
+    all_caps && (letters.len() < 5 || decoy)
 }
 
 /// See [`Scanner::match_line`].
@@ -758,12 +819,43 @@ mod tests {
     }
 
     #[test]
+    fn all_caps_decoys_and_fragments() {
+        let index = NameIndex::from_bytes(
+            br#"{"version":1,"entries":[
+                {"key":"prosperity","name":"Prosperity","oracle_id":"p","lang":"en"},
+                {"key":"curiosity","name":"Curiosity","oracle_id":"c","lang":"en"},
+                {"key":"bat","name":"Bat-","oracle_id":"b","lang":"en"}]}"#,
+            false,
+        )
+        .unwrap();
+        let check = |t: &str| decoy_or_fragment(t, &index.match_raw(t));
+        assert!(check("PRASPERITY"));
+        assert!(check("PROSPERITY"));
+        assert!(!check("Prosperity"));
+        assert!(!check("CURIOSITY"));
+        assert!(check("BAT"));
+        assert!(!check("Bat"));
+    }
+
+    #[test]
     fn name_bar_shape() {
         assert!(looks_like_name_bar("Lightning Bolt"));
         assert!(looks_like_name_bar("Relâmpago"));
         assert!(!looks_like_name_bar("/PROSPERITY8O0"));
         assert!(!looks_like_name_bar("ENCHANTMENT"));
         assert!(!looks_like_name_bar("oço das Bruxarias"));
+        assert!(!looks_like_name_bar("WasteLand"));
+        assert!(!looks_like_name_bar("BalÍightning"));
+        assert!(looks_like_name_bar("Will-o'-the-Wisp"));
+        let index = NameIndex::from_bytes(
+            br#"{"version":1,"entries":[
+                {"key":"beloved chaplain","name":"Beloved Chaplain","oracle_id":"b","lang":"en"},
+                {"key":"blightning","name":"Blightning","oracle_id":"l","lang":"en"}]}"#,
+            false,
+        )
+        .unwrap();
+        assert!(equal_ignoring_spaces(&index.match_raw("BelovedChaplain")));
+        assert!(!equal_ignoring_spaces(&index.match_raw("BalÍightning")));
     }
 
     #[test]
