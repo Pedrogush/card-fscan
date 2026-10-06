@@ -271269,8 +271269,8 @@
       },
       {
        "slot": 2,
-       "oracle_id": "9ef2a604-4053-4ce0-bc08-43d9cc0b15cc",
-       "name": "Efígie Desdenhosa",
+       "oracle_id": "b8739fc4-6308-4e49-be2e-d9d92d890ee1",
+       "name": "Coroa Rúnica",
        "lang": "pt",
        "category": "pt",
        "scryfall_id": "9981a703-292d-43d1-8117-8bee2a585812",
@@ -271279,7 +271279,8 @@
         0.077,
         0.089,
         0.129
-       ]
+       ],
+       "note": "Scryfall image for Efigie Desdenhosa (KHM PT) actually shows Coroa Runica; truth follows the printed name"
       },
       {
        "slot": 3,
