@@ -183,6 +183,10 @@ pub struct NameIndex {
     /// Distinct oracle ids, sorted ascending, so that comparing indices is the
     /// same as comparing the id strings (used for tie-breaking).
     oracle_ids: Vec<String>,
+    /// `by_len[l]`: indices of the entries whose key is `l` bytes long, in
+    /// index order. Lets a query skip whole lengths that cannot score high
+    /// enough (see `top_candidates`).
+    by_len: Vec<Vec<u32>>,
 }
 
 /// One scored oracle id.
@@ -248,6 +252,16 @@ impl Best {
         }
         (self.lcs2 as u64) * (other.lensum as u64) > (other.lcs2 as u64) * (self.lensum as u64)
     }
+
+    /// Compare scores as exact fractions; an empty `Best` ranks lowest.
+    fn cmp_score(&self, other: &Best) -> std::cmp::Ordering {
+        match (self.lensum, other.lensum) {
+            (0, 0) => std::cmp::Ordering::Equal,
+            (0, _) => std::cmp::Ordering::Less,
+            (_, 0) => std::cmp::Ordering::Greater,
+            _ => ((self.lcs2 as u64) * (other.lensum as u64)).cmp(&((other.lcs2 as u64) * (self.lensum as u64))),
+        }
+    }
 }
 
 impl NameIndex {
@@ -284,8 +298,13 @@ impl NameIndex {
                 let oracle = oracle_ids.binary_search(&e.oracle_id).expect("id was collected") as u32;
                 Entry { key: e.key, name: e.name, lang: e.lang, oracle }
             })
-            .collect();
-        NameIndex { entries, oracle_ids }
+            .collect::<Vec<Entry>>();
+        let max_len = entries.iter().map(|e| e.key.len()).max().unwrap_or(0);
+        let mut by_len = vec![Vec::new(); max_len + 1];
+        for (i, e) in entries.iter().enumerate() {
+            by_len[e.key.len()].push(i as u32);
+        }
+        NameIndex { entries, oracle_ids, by_len }
     }
 
     pub fn len(&self) -> usize {
@@ -321,9 +340,57 @@ impl NameIndex {
         MatchResult { status, cleaned, key, candidates }
     }
 
-    /// Score `key` against all entries; return the `n` best distinct oracle
+    /// Score `key` against the index; return the `n` best distinct oracle
     /// ids ordered by score descending, then oracle id ascending.
+    ///
+    /// Pruning (exact, results identical to scoring every entry): an entry
+    /// of length `l` can share at most `min(len(key), l)` characters with the
+    /// key, so its score is at most `100 * 2 min / (len(key) + l)`. Lengths
+    /// are visited from the highest such bound down, and the scan stops as
+    /// soon as the bound is strictly below the current n-th best score: no
+    /// remaining entry could enter the top n or change a member of it.
     pub fn top_candidates(&self, key: &str, n: usize) -> Vec<Candidate> {
+        let la = key.len() as u32;
+        let pattern = LcsPattern::new(key.as_bytes());
+        // Upper bound for each non-empty length, as a fraction lcs2 / lensum.
+        let mut lengths: Vec<(u32, Best)> = (0..self.by_len.len() as u32)
+            .filter(|&l| !self.by_len[l as usize].is_empty())
+            .map(|l| (l, Best { lcs2: 2 * la.min(l), lensum: la + l, entry: 0 }))
+            .collect();
+        // `sort_by` with a closure: highest bound first.
+        lengths.sort_by(|a, b| b.1.cmp_score(&a.1));
+
+        let mut best: Vec<Best> = vec![Best::NONE; self.oracle_ids.len()];
+        // The running top n as (oracle, its best), best first.
+        let mut top: Vec<(u32, Best)> = Vec::with_capacity(n + 1);
+        for (l, bound) in lengths {
+            if n == 0 || (top.len() == n && bound.cmp_score(&top[n - 1].1).is_lt()) {
+                break;
+            }
+            for &i in &self.by_len[l as usize] {
+                let e = &self.entries[i as usize];
+                let lcs = pattern.lcs(e.key.as_bytes()) as u32;
+                let cand = Best { lcs2: 2 * lcs, lensum: la + l, entry: i };
+                let slot = &mut best[e.oracle as usize];
+                // Per oracle: higher score wins; on a tie the earlier entry
+                // in index order (entries are not visited in index order).
+                let better = match cand.cmp_score(slot) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => slot.lensum == 0 || cand.entry < slot.entry,
+                    std::cmp::Ordering::Less => false,
+                };
+                if better {
+                    *slot = cand;
+                    update_top(&mut top, e.oracle, cand, n);
+                }
+            }
+        }
+        top.iter().map(|&(_, b)| self.candidate(key, b)).collect()
+    }
+
+    /// Reference version of [`top_candidates`](Self::top_candidates) that
+    /// scores every entry (used by tests to check the pruning).
+    pub fn top_candidates_exhaustive(&self, key: &str, n: usize) -> Vec<Candidate> {
         let pattern = LcsPattern::new(key.as_bytes());
         let mut best = vec![Best::NONE; self.oracle_ids.len()];
         for (i, e) in self.entries.iter().enumerate() {
@@ -346,20 +413,38 @@ impl NameIndex {
             top.insert(pos, *b);
             top.truncate(n);
         }
-        top.iter()
-            .map(|b| {
-                let e = &self.entries[b.entry as usize];
-                let lcs = (b.lcs2 / 2) as usize;
-                let raw_score = ratio_from_lcs(key.len(), e.key.len(), lcs);
-                Candidate {
-                    name: e.name.clone(),
-                    oracle_id: self.oracle_ids[e.oracle as usize].clone(),
-                    lang: e.lang.clone(),
-                    key: e.key.clone(),
-                    score: reference_score(raw_score),
-                }
-            })
-            .collect()
+        top.iter().map(|&b| self.candidate(key, b)).collect()
+    }
+
+    fn candidate(&self, key: &str, b: Best) -> Candidate {
+        let e = &self.entries[b.entry as usize];
+        let lcs = (b.lcs2 / 2) as usize;
+        let raw_score = ratio_from_lcs(key.len(), e.key.len(), lcs);
+        Candidate {
+            name: e.name.clone(),
+            oracle_id: self.oracle_ids[e.oracle as usize].clone(),
+            lang: e.lang.clone(),
+            key: e.key.clone(),
+            score: reference_score(raw_score),
+        }
+    }
+}
+
+/// Record that `oracle`'s best is now `b` in the running top-n list, which is
+/// ordered by score descending, then oracle id ascending.
+fn update_top(top: &mut Vec<(u32, Best)>, oracle: u32, b: Best, n: usize) {
+    if let Some(pos) = top.iter().position(|&(o, _)| o == oracle) {
+        top.remove(pos);
+    }
+    // Does `(oracle, b)` rank before `(o, t)`?
+    let before = |&(o, t): &(u32, Best)| match b.cmp_score(&t) {
+        std::cmp::Ordering::Equal => oracle < o,
+        ord => ord.is_gt(),
+    };
+    let pos = top.iter().position(before).unwrap_or(top.len());
+    if pos < n {
+        top.insert(pos, (oracle, b));
+        top.truncate(n);
     }
 }
 

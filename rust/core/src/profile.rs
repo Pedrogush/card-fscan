@@ -73,10 +73,12 @@ pub enum Count {
     RetryCrops,
     /// Sum of model input widths in pixels (a proxy for OCR work; includes padding).
     OcrPixelsWide,
+    /// Lines read by the fast first-pass reader (included in `OcrLines`).
+    FastLines,
 }
 
 const N_STAGES: usize = Stage::ALL.len();
-const N_COUNTS: usize = 6;
+const N_COUNTS: usize = 7;
 
 #[derive(Default)]
 pub struct Profile {
@@ -144,6 +146,7 @@ impl Profile {
             retry_slots: self.get(Count::RetrySlots),
             retry_crops: self.get(Count::RetryCrops),
             ocr_input_px_wide: self.get(Count::OcrPixelsWide),
+            fast_lines: self.get(Count::FastLines),
         }
     }
 }

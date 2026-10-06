@@ -27,6 +27,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 rten = { version = "0.27", default-features = false, features = ["onnx_format", "rten_format"] }
 rten-tensor = "0.27"
 rayon = "1"
+# Already used inside `image`; used directly to decode only the JPEG luma plane.
+zune-jpeg = "0.5"
+zune-core = "0.5"
 
 [profile.release]
 debug = "line-tables-only"

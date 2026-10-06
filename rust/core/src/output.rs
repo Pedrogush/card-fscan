@@ -140,6 +140,8 @@ pub struct Counters {
     pub retry_crops: u64,
     /// Sum over model runs of batch_size * padded input width (pixels).
     pub ocr_input_px_wide: u64,
+    /// Lines read by the fast first-pass model (part of `ocr_lines`).
+    pub fast_lines: u64,
 }
 
 #[cfg(test)]

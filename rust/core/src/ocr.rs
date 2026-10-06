@@ -12,7 +12,10 @@ use std::path::Path;
 
 use image::GrayImage;
 use image::imageops::{FilterType, resize};
-use rten::Model;
+use std::sync::Arc;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use rten::{Model, RunOptions, ThreadPool};
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, NdTensorView, Tensor};
 
@@ -68,6 +71,65 @@ pub struct RtenRecognizer {
     /// Horizontal squeeze applied after resizing to `input_height` (1.0 =
     /// keep the aspect ratio). Narrower inputs are proportionally faster.
     pub width_scale: f64,
+    /// How batches use the CPU cores; see [`Threading`].
+    pub threading: Threading,
+}
+
+/// Two ways to spread OCR over cores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Threading {
+    /// One batch at a time; rten splits each operator across its own thread
+    /// pool. Good for big models, poor for this small one: most layers are
+    /// too small to split well.
+    IntraOp,
+    /// Several batches at once on rayon's pool (one per core), each run
+    /// single-threaded. Every core does useful work all the time.
+    InterBatch,
+}
+
+/// Run `f` on every item using `workers` plain OS threads that pull the next
+/// unclaimed item from a shared atomic counter, and return the results in
+/// item order.
+///
+/// Why not rayon's `par_iter`? rten hands each run to the given (one-thread)
+/// pool and waits; a *rayon* thread that waits like that keeps stealing other
+/// items meanwhile, so far more runs than cores end up in flight. Scoped
+/// threads (`std::thread::scope`) may borrow local data, and exactly
+/// `workers` runs execute at once.
+fn run_on_workers<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    f: impl Fn(&T) -> Result<R, Error> + Sync,
+) -> Result<Vec<R>, Error> {
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<Option<Result<R, Error>>> = (0..items.len()).map(|_| None).collect();
+    let per_thread: Vec<Vec<(usize, Result<R, Error>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.clamp(1, items.len().max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(k) else { break };
+                        done.push((k, f(item)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("OCR worker panicked")).collect()
+    });
+    for (k, r) in per_thread.into_iter().flatten() {
+        slots[k] = Some(r);
+    }
+    slots.into_iter().map(|r| r.expect("every item was processed")).collect()
+}
+
+thread_local! {
+    /// A one-thread rten pool per worker thread, so a model run started on
+    /// this thread stays single-threaded (rten would otherwise use its global,
+    /// all-cores pool). `thread_local!` gives each OS thread its own copy.
+    static SERIAL_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::with_num_threads(1));
 }
 
 /// The `ocrs` model's character set (copied from the ocrs crate, MIT/Apache).
@@ -96,7 +158,12 @@ impl RtenRecognizer {
             None => (ModelKind::Ocrs, OCRS_ALPHABET.chars().collect()),
         };
         let input_height = kind.input_height();
-        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 8, max_width: 640, input_height, width_scale: 1.0 })
+        Ok(RtenRecognizer { model, kind, alphabet, batch_size: 8, max_width: 640, input_height, width_scale: 1.0, threading: Threading::InterBatch })
+    }
+
+    /// Number of concurrent model runs in [`Threading::InterBatch`] mode.
+    fn workers(&self) -> usize {
+        std::thread::available_parallelism().map_or(4, |n| n.get())
     }
 
     pub fn kind(&self) -> ModelKind {
@@ -144,9 +211,17 @@ impl RtenRecognizer {
         prof.count(Count::OcrBatches, 1);
         prof.count(Count::OcrPixelsWide, (input.size(0) * input.size(3)) as u64);
         let t = Instant::now();
+        let opts = match self.threading {
+            Threading::IntraOp => None,
+            Threading::InterBatch => {
+                // `RunOptions` is `#[non_exhaustive]` (no struct literal from
+                // outside rten), so use its builder method.
+                Some(RunOptions::default().with_thread_pool(Some(SERIAL_POOL.with(Arc::clone))))
+            }
+        };
         let output = self
             .model
-            .run_one(input.view().into(), None)
+            .run_one(input.view().into(), opts)
             .map_err(|e| Error::Model(e.to_string()))?;
         prof.add(Stage::OcrInfer, t);
         let t = Instant::now();
@@ -172,10 +247,26 @@ impl Recognizer for RtenRecognizer {
         let mut order: Vec<usize> = (0..lines.len()).collect();
         let aspect = |i: usize| lines[i].width() as f64 / lines[i].height().max(1) as f64;
         order.sort_by(|&a, &b| aspect(a).total_cmp(&aspect(b)));
-        let mut out = vec![None; lines.len()];
-        for chunk in order.chunks(self.batch_size.max(1)) {
+        // Small rounds (e.g. the few slots a fallback pass re-reads) would
+        // fill only one or two batches and leave the other cores idle, so the
+        // batch shrinks until every worker gets one.
+        let batch = match self.threading {
+            Threading::IntraOp => self.batch_size,
+            Threading::InterBatch => self.batch_size.min(lines.len().div_ceil(self.workers())),
+        };
+        let chunks: Vec<&[usize]> = order.chunks(batch.max(1)).collect();
+        let run = |chunk: &&[usize]| {
             let batch: Vec<GrayImage> = chunk.iter().map(|&i| lines[i].clone()).collect();
-            for (&i, line) in chunk.iter().zip(self.run_batch(&batch, prof)?) {
+            self.run_batch(&batch, prof)
+        };
+        let results: Vec<Vec<OcrLine>> = match self.threading {
+            // `collect::<Result<_, _>>()` stops at the first error.
+            Threading::IntraOp => chunks.iter().map(run).collect::<Result<_, _>>()?,
+            Threading::InterBatch => run_on_workers(&chunks, self.workers(), run)?,
+        };
+        let mut out = vec![None; lines.len()];
+        for (chunk, lines_out) in chunks.iter().zip(results) {
+            for (&i, line) in chunk.iter().zip(lines_out) {
                 out[i] = Some(line);
             }
         }

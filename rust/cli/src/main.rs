@@ -4,6 +4,7 @@
 //! fscan scan  --out <dir> [options] <image>...     one JSON per photo (SPEC §5)
 //! fscan bench [--reps N] [--out <dir>] [options] <image>...   per-stage timing table
 //! options: --names <names_v1.json[.gz]>  --model <rec model>  --dump-crops <dir>
+//!          --ocr-batch N  --intra-op (rten's own threading, the Phase 1 behaviour)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -12,9 +13,11 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use fscan_core::Scanner;
 use fscan_core::matching::NameIndex;
-use fscan_core::ocr::RtenRecognizer;
+use fscan_core::ocr::{RtenRecognizer, Threading};
 use fscan_core::output::{PhotoResult, SlotStatus, Timing};
 use fscan_core::pipeline::decode_gray;
+
+mod cpu;
 
 #[derive(PartialEq)]
 enum Mode {
@@ -27,8 +30,11 @@ struct Args {
     out: Option<PathBuf>,
     names: PathBuf,
     model: PathBuf,
+    fast_model: Option<PathBuf>,
     dump: Option<PathBuf>,
     reps: usize,
+    ocr_batch: Option<usize>,
+    intra_op: bool,
     images: Vec<PathBuf>,
 }
 
@@ -48,8 +54,11 @@ fn parse_args() -> Result<Args> {
         out: None,
         names: root.join("testdata/names/names_v1.json"),
         model: root.join("rust/models/en_PP-OCRv5_rec_mobile.onnx"),
+        fast_model: None,
         dump: None,
         reps: 3,
+        ocr_batch: None,
+        intra_op: false,
         images: Vec::new(),
     };
     while let Some(a) = args.next() {
@@ -60,7 +69,10 @@ fn parse_args() -> Result<Args> {
             "--out" => parsed.out = Some(PathBuf::from(value()?)),
             "--names" => parsed.names = PathBuf::from(value()?),
             "--model" => parsed.model = PathBuf::from(value()?),
+            "--fast-model" => parsed.fast_model = Some(PathBuf::from(value()?)),
             "--dump-crops" => parsed.dump = Some(PathBuf::from(value()?)),
+            "--ocr-batch" => parsed.ocr_batch = Some(value()?.parse().context("--ocr-batch needs a number")?),
+            "--intra-op" => parsed.intra_op = true,
             "--reps" => parsed.reps = value()?.parse().context("--reps needs a number")?,
             "-h" | "--help" => bail!(USAGE),
             _ => parsed.images.push(PathBuf::from(a)),
@@ -100,8 +112,19 @@ fn main() -> Result<()> {
 
     let t = Instant::now();
     let index = NameIndex::load(&args.names).with_context(|| format!("loading {}", args.names.display()))?;
-    let recognizer = RtenRecognizer::load(&args.model).with_context(|| format!("loading {}", args.model.display()))?;
+    let mut recognizer =
+        RtenRecognizer::load(&args.model).with_context(|| format!("loading {}", args.model.display()))?;
+    if let Some(b) = args.ocr_batch {
+        recognizer.batch_size = b;
+    }
+    if args.intra_op {
+        recognizer.threading = Threading::IntraOp;
+    }
     let mut scanner = Scanner::new(index, Box::new(recognizer));
+    if let Some(path) = &args.fast_model {
+        let fast = RtenRecognizer::load(path).with_context(|| format!("loading {}", path.display()))?;
+        scanner.fast_recognizer = Some(Box::new(fast));
+    }
     if let Some(dir) = &args.dump {
         std::fs::create_dir_all(dir)?;
         scanner.params.dump_dir = Some(dir.clone());
@@ -110,9 +133,12 @@ fn main() -> Result<()> {
 
     let reps = if args.mode == Mode::Bench { args.reps.max(1) } else { 1 };
     let mut timings: Vec<Timing> = Vec::new();
+    let mut cpu: Vec<f64> = Vec::new();
     for rep in 0..reps {
         for path in &args.images {
+            let c0 = cpu::process_cpu_ms();
             let (result, json) = run_one(&scanner, path)?;
+            cpu.push(cpu::process_cpu_ms() - c0);
             if let Some(out) = &args.out {
                 std::fs::write(out.join(format!("{}.json", result.image)), json)?;
             }
@@ -124,6 +150,9 @@ fn main() -> Result<()> {
     }
     if args.mode == Mode::Bench {
         print_table(&timings, reps);
+        let (mean, p50, p95) = stats(&mut cpu);
+        println!("
+Process CPU time per photo (all threads, insensitive to other load): mean {mean:.0} ms, p50 {p50:.0}, p95 {p95:.0}");
     } else {
         let mean = timings.iter().map(|t| t.total).sum::<f64>() / timings.len() as f64;
         println!("{} photos, mean {mean:.0} ms/photo", timings.len());
@@ -179,11 +208,12 @@ fn print_table(timings: &[Timing], reps: usize) {
         ("clean+normalise", |t| t.stages.clean),
         ("matching", |t| t.stages.match_),
     ];
-    let counters: [(&str, fn(&Timing) -> f64); 7] = [
+    let counters: [(&str, fn(&Timing) -> f64); 8] = [
         ("slots", |t| t.counters.slots as f64),
         ("ocr calls", |t| t.counters.ocr_calls as f64),
         ("ocr batches", |t| t.counters.ocr_batches as f64),
         ("ocr lines", |t| t.counters.ocr_lines as f64),
+        ("  of which fast model", |t| t.counters.fast_lines as f64),
         ("crops per slot", |t| t.counters.crops_per_slot),
         ("retry slots", |t| t.counters.retry_slots as f64),
         ("ocr input px wide", |t| t.counters.ocr_input_px_wide as f64),

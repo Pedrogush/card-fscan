@@ -65,3 +65,42 @@ fn shared_match_cases() {
     }
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
 }
+
+/// The length-pruned search must return exactly what scoring every entry
+/// returns: same oracle ids, names and scores, in the same order.
+#[test]
+fn pruned_search_equals_exhaustive() {
+    use fscan_core::matching::normalize;
+    let root = repo_root();
+    let index = NameIndex::load(&root.join("testdata/names/names_v1.json")).expect("load names_v1.json");
+    let index_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("testdata/names/names_v1.json")).unwrap()).unwrap();
+    let keys: Vec<String> = index_json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .step_by(331)
+        .map(|e| e["key"].as_str().unwrap().to_string())
+        .collect();
+    // Exact keys plus OCR-like damage: truncation, a substitution, a junk
+    // suffix, tiny fragments.
+    let mut queries = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        queries.push(k.clone());
+        queries.push(k.chars().take(k.len() * 2 / 3).collect());
+        let mut sub: Vec<char> = k.chars().collect();
+        let j = i % sub.len();
+        sub[j] = if sub[j] == 'e' { 'c' } else { 'e' };
+        queries.push(sub.into_iter().collect());
+        queries.push(format!("{k} xq"));
+        queries.push(k.chars().take(2).collect());
+    }
+    for raw in ["mo", "x", "the", "a b c", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
+        queries.push(raw.to_string());
+    }
+    for q in queries.iter().map(|q| normalize(q)).filter(|q| !q.is_empty()) {
+        let fast = index.top_candidates(&q, 3);
+        let slow = index.top_candidates_exhaustive(&q, 3);
+        assert_eq!(fast, slow, "query {q:?}");
+    }
+}

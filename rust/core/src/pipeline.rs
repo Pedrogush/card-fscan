@@ -58,7 +58,11 @@ impl Default for ScanParams {
 pub struct Scanner {
     pub index: NameIndex,
     /// `Box<dyn Trait>`: any type implementing `Recognizer`, chosen at runtime.
+    /// The accurate reader.
     pub recognizer: Box<dyn Recognizer>,
+    /// Optional cheap first reader: when set, it reads every slot first and
+    /// `recognizer` only re-reads the slots it did not auto-accept.
+    pub fast_recognizer: Option<Box<dyn Recognizer>>,
     pub params: ScanParams,
 }
 
@@ -106,7 +110,7 @@ impl Read {
 
 impl Scanner {
     pub fn new(index: NameIndex, recognizer: Box<dyn Recognizer>) -> Self {
-        Scanner { index, recognizer, params: ScanParams::default() }
+        Scanner { index, recognizer, fast_recognizer: None, params: ScanParams::default() }
     }
 
     /// SPEC §2.1-2.4: find the markers, decide the config, and work out each
@@ -186,7 +190,7 @@ impl Scanner {
         let mut columns: Vec<ColumnResult> = layout.unreadable.iter().map(|&j| error_column(j)).collect();
 
         let t_crop = Instant::now();
-        let crops = self.crops(photo, &layout, &prof);
+        let mut crops = self.crops(photo, &layout, &prof);
         if let Some(dir) = &self.params.dump_dir {
             let stem = image_name.rsplit_once('.').map_or(image_name, |(s, _)| s);
             for c in &crops {
@@ -197,51 +201,78 @@ impl Scanner {
         timing.crop = ms_since(t_crop);
 
         // SPEC §2.6-2.7, pass 1: OCR + match the crops as they are.
+        // `mem::take` moves each image out of its SlotCrop (leaving an empty
+        // one behind) instead of copying ~50 KB per slot.
+        let images: Vec<GrayImage> = crops.iter_mut().map(|c| std::mem::take(&mut c.image)).collect();
+        let first = self.fast_recognizer.as_deref().unwrap_or(self.recognizer.as_ref());
         let t_ocr = Instant::now();
-        let images: Vec<GrayImage> = crops.iter().map(|c| c.image.clone()).collect();
-        let lines = self.recognizer.recognize(&images, &prof)?;
+        let lines = first.recognize(&images, &prof)?;
         timing.ocr = ms_since(t_ocr);
         let t_match = Instant::now();
         let mut reads = self.match_all(lines, &prof);
         timing.match_ = ms_since(t_match);
 
-        // Pass 2: slots that didn't auto-accept get more attempts: the
-        // inverted crop (white-on-dark name bars), the second-best text line
-        // and the untrimmed line. The best-scoring match wins.
-        let retry: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
-        if !retry.is_empty() {
-            let t_retry = Instant::now();
-            prof.count(Count::RetrySlots, retry.len() as u64);
-            let geometry_of =
-                |j: usize| &layout.columns.iter().find(|c| c.geometry.column == j).expect("crop of a known column").geometry;
-            let mut variants = vec![CropVariant::SecondLine, CropVariant::Untrimmed];
-            if self.params.try_inverted {
-                variants.push(CropVariant::Inverted);
-            }
-            // (read index, crop) for every fallback crop that exists.
-            let jobs: Vec<(usize, GrayImage)> = retry
-                .par_iter()
-                .flat_map_iter(|&k| {
-                    let c = &crops[k];
-                    let g = geometry_of(c.column);
-                    let prof = &prof;
-                    variants.iter().filter_map(move |&v| {
-                        self.slot_crop(photo, g, c.slot, c.shift_mm, v, prof).map(|(img, _)| (k, img))
-                    })
-                })
-                .collect();
-            prof.count(Count::RetryCrops, jobs.len() as u64);
-            let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
+        // Pass 1b (reader cascade): the accurate model re-reads what the fast
+        // one could not auto-accept; the better match wins.
+        if self.fast_recognizer.is_some() {
+            prof.count(Count::FastLines, images.len() as u64);
+            let todo: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
+            let sub: Vec<GrayImage> = todo.iter().map(|&k| images[k].clone()).collect();
             let t_ocr = Instant::now();
-            let lines = self.recognizer.recognize(&extra, &prof)?;
+            let lines = self.recognizer.recognize(&sub, &prof)?;
             timing.ocr += ms_since(t_ocr);
             let t_match = Instant::now();
-            for (k, alt) in owners.into_iter().zip(self.match_all(lines, &prof)) {
+            for (k, alt) in todo.into_iter().zip(self.match_all(lines, &prof)) {
                 if alt.better_than(&reads[k]) {
                     reads[k] = alt;
                 }
             }
             timing.match_ += ms_since(t_match);
+        }
+
+        // Pass 2: slots that didn't auto-accept get more attempts, as a
+        // cascade: one fallback crop variant per round, and only for slots
+        // still not auto-accepted. A variant is skipped when it would just
+        // repeat the primary crop (see `slot_crop`). Per round, the
+        // better-scoring reading wins.
+        let mut pending: Vec<usize> = (0..reads.len()).filter(|&k| reads[k].m.status != MatchStatus::Auto).collect();
+        if !pending.is_empty() {
+            let t_retry = Instant::now();
+            prof.count(Count::RetrySlots, pending.len() as u64);
+            let geometry_of =
+                |j: usize| &layout.columns.iter().find(|c| c.geometry.column == j).expect("crop of a known column").geometry;
+            let mut variants = vec![CropVariant::Untrimmed, CropVariant::SecondLine];
+            if self.params.try_inverted {
+                variants.push(CropVariant::Inverted);
+            }
+            for v in variants {
+                if pending.is_empty() {
+                    break;
+                }
+                let t_crop = Instant::now();
+                // (read index, crop) for every slot where this variant exists.
+                let jobs: Vec<(usize, GrayImage)> = pending
+                    .par_iter()
+                    .filter_map(|&k| {
+                        let c = &crops[k];
+                        self.slot_crop(photo, geometry_of(c.column), c.slot, c.shift_mm, v, &prof).map(|(img, _)| (k, img))
+                    })
+                    .collect();
+                timing.crop += ms_since(t_crop);
+                prof.count(Count::RetryCrops, jobs.len() as u64);
+                let (owners, extra): (Vec<usize>, Vec<GrayImage>) = jobs.into_iter().unzip();
+                let t_ocr = Instant::now();
+                let lines = self.recognizer.recognize(&extra, &prof)?;
+                timing.ocr += ms_since(t_ocr);
+                let t_match = Instant::now();
+                for (k, alt) in owners.into_iter().zip(self.match_all(lines, &prof)) {
+                    if alt.better_than(&reads[k]) {
+                        reads[k] = alt;
+                    }
+                }
+                timing.match_ += ms_since(t_match);
+                pending.retain(|&k| reads[k].m.status != MatchStatus::Auto);
+            }
             timing.retry = ms_since(t_retry);
         }
 
@@ -343,10 +374,16 @@ impl Scanner {
         } else if variant == CropVariant::SecondLine {
             return None;
         }
-        if self.params.trim_right && variant != CropVariant::Untrimmed {
+        if self.params.trim_right {
             let x1 = prof.time(Stage::Trim, || text_right_end(&crop));
-            crop = image::imageops::crop_imm(&crop, 0, 0, x1, crop.height()).to_image();
-        } else if variant == CropVariant::Untrimmed && !self.params.trim_right {
+            match variant {
+                // The untrimmed variant only differs from the primary crop
+                // when the trim actually cut something.
+                CropVariant::Untrimmed if x1 >= crop.width() => return None,
+                CropVariant::Untrimmed => {}
+                _ => crop = image::imageops::crop_imm(&crop, 0, 0, x1, crop.height()).to_image(),
+            }
+        } else if variant == CropVariant::Untrimmed {
             return None;
         }
         let t = Instant::now();
@@ -426,8 +463,27 @@ fn strip_mana_token(text: &str) -> Option<&str> {
 
 /// Decode a JPEG/PNG photo to 8-bit grayscale. Returns the image and the
 /// milliseconds spent decoding and converting to gray.
+///
+/// JPEGs store brightness (Y) and colour (Cb, Cr) separately, and the
+/// pipeline only needs Y. Asking zune-jpeg for `Luma` output skips the colour
+/// planes' storage, upsampling and colour conversion, so the gray image comes
+/// straight out of the decoder (the "gray" step then costs nothing). Other
+/// formats go through the `image` crate.
 pub fn decode_gray(bytes: &[u8]) -> Result<(GrayImage, f64, f64), Error> {
     let t = Instant::now();
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+        let options = DecoderOptions::default()
+            .jpeg_set_out_colorspace(ColorSpace::Luma)
+            .set_max_width(1 << 16)
+            .set_max_height(1 << 16);
+        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+        let pixels = decoder.decode().map_err(|e| Error::Invalid(format!("JPEG decode: {e:?}")))?;
+        let (w, h) = decoder.dimensions().ok_or_else(|| Error::Invalid("JPEG without dimensions".into()))?;
+        let gray = GrayImage::from_raw(w as u32, h as u32, pixels)
+            .ok_or_else(|| Error::Invalid("JPEG luma buffer has the wrong size".into()))?;
+        return Ok((gray, ms_since(t), 0.0));
+    }
     let img = image::load_from_memory(bytes)?;
     let decode = ms_since(t);
     let t = Instant::now();
