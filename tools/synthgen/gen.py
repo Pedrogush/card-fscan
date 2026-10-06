@@ -66,6 +66,14 @@ LEVELS: dict[str, dict[str, Any]] = {
                  tray_xy=3.0, tray_rot=1.5, tray_jit=(1.5, 0.3), shadow=(0.2, 0.45)),
 }
 
+# Rack mode (SPEC 1b): racks are physical objects pushed against the foot, and
+# cards sit in grooves, so placement noise is much smaller than on paper strips.
+RACK_LEVELS: dict[str, dict[str, float]] = {
+    "easy": dict(rack_xy=0.5, rack_rot=0.2, rack_gap=0.1, rack_jit_y=0.2, rack_jit_rot=0.05, card_dx=0.2, card_slide=0.1),
+    "normal": dict(rack_xy=0.8, rack_rot=0.35, rack_gap=0.2, rack_jit_y=0.3, rack_jit_rot=0.08, card_dx=0.35, card_slide=0.2),
+    "hard": dict(rack_xy=1.0, rack_rot=0.5, rack_gap=0.3, rack_jit_y=0.4, rack_jit_rot=0.1, card_dx=0.5, card_slide=0.3),
+}
+
 EVAL_NOTES = {
     "slot_lang": "en | pt | other. 'other' = a printing in a language outside the index (ja, de, ...). "
                  "Readers may return review/empty for these; they are excluded from the auto-rate "
@@ -89,6 +97,16 @@ def _round(x: float, n: int = 4) -> float:
 
 def plan_recipes(set_name: str, n: int, rng: np.random.Generator) -> list[dict[str, Any]]:
     """Structure of each image: config, level, partial / negative kind."""
+    if set_name == "rack_smoke" and n == 16:
+        configs = ["C4"] * 10 + ["C6"] * 6
+        levels = ["easy"] * 4 + ["normal"] * 8 + ["hard"] * 4
+        configs = [configs[i] for i in rng.permutation(n)]
+        levels = [levels[i] for i in rng.permutation(n)]
+        kinds: list[str | None] = ["one", "two", "occluded_marker", "wrong_count"] + [None] * (n - 4)
+        kinds = [kinds[i] for i in rng.permutation(n)]
+        return [dict(config=c, level=lv, partial=k if k in ("one", "two") else None,
+                     negative=k if k in ("occluded_marker", "wrong_count") else None)
+                for c, lv, k in zip(configs, levels, kinds)]
     if set_name == "smoke" and n == 8:
         return [
             dict(config="C4", level="easy", partial=None, negative=None),
@@ -224,6 +242,10 @@ def sample_camera(cfg: dict[str, Any], lv: dict[str, Any], ncols: int, rng: np.r
 def render_entry(entry: dict[str, Any], sf: Scryfall) -> tuple[bytes, dict[str, Any], dict[str, Any]]:
     """Render one manifest entry. Returns (jpeg, difficulty, aux) where aux has
     the true marker corners in image px and the per-column strip->image maps."""
+    if entry.get("mode") == "rack":
+        import rack  # noqa: PLC0415
+
+        return rack.render_entry_rack(entry, sf, sys.modules[__name__])
     cfg = R.CONFIGS[entry["config"]]
     lv = LEVELS[entry["level"]]
     ncols = cfg["cols"]
@@ -564,7 +586,8 @@ uv run --project tools tools/synthgen/gen.py --set {set_name} --regen
 That downloads the card images once into `testdata/cache/` (gitignored) and
 rebuilds every image bit-for-bit from the per-image seeds in the manifest (same
 machine and pinned library versions). The set was created with
-`gen.py --set {set_name} --n {n} --seed {seed}` (card pool {manifest.get("pool", "v1")}).
+`gen.py --set {set_name} --n {n} --seed {seed}{" --mode rack" if manifest.get("mode") == "rack" else ""}` (card pool {manifest.get("pool", "v1")}).
+{"Rack mode: cards stand in the tilted-slot racks of SPEC section 1b / fab/ (3D-rendered, name text up to ~3.6 mm below the marker plane)." if manifest.get("mode") == "rack" else ""}
 
 Contents: {n} images ({', '.join(f'{v} {k}' for k, v in sorted(by_cfg.items()))};
 {', '.join(f'{v} {k}' for k, v in sorted(by_lv.items()))}), {slots} true card slots
@@ -594,6 +617,8 @@ def main() -> None:
     ap.add_argument("--debug", nargs="*", default=None,
                     help="write slot crops for these stems (no args: all) to testdata/<set>/_debug")
     ap.add_argument("--workers", type=int, default=1, help="render processes (<= 2 recommended)")
+    ap.add_argument("--mode", choices=["flat", "rack"], default="flat",
+                    help="flat = paper strips (SPEC 1); rack = tilted-slot racks (SPEC 1b)")
     ap.add_argument("--pool", type=int, default=2, help="card pool version for planning new sets (smoke/dev: 1)")
     args = ap.parse_args()
     lower_priority()
@@ -623,9 +648,11 @@ def _main(args: argparse.Namespace, set_dir: Path) -> None:
             seed = args.seed * 100_000 + k
             key = f"{args.set_name}/{rec['config'].lower()}_{k:04d}.jpg"
             images[key] = plan_image(rec, seed, pool)
+            if args.mode == "rack":
+                images[key]["mode"] = "rack"
         manifest = {
             "spec_version": 1, "set": args.set_name, "generator": GENERATOR, "seed": args.seed,
-            "pool": f"v{args.pool}",
+            "pool": f"v{args.pool}", "mode": args.mode,
             "card_images": "Scryfall 'large' JPEG (672x936, ~10.7 px/mm); card art (c) Wizards of the Coast",
             "eval_notes": EVAL_NOTES, "images": images,
         }

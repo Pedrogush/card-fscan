@@ -289,15 +289,47 @@ class Camera:
         t = -self.R @ self.C
         return K @ np.column_stack([self.R[:, 0], self.R[:, 1], t])
 
+    def H_at(self, z: float) -> np.ndarray:
+        """Homography for the plane Z = z (Z points away from the camera, i.e.
+        z > 0 is below the reference plane) -> ideal pixel."""
+        K = np.array([[self.f_px, 0, self.width / 2], [0, self.f_px, self.height / 2], [0, 0, 1]])
+        t = -self.R @ self.C + self.R[:, 2] * z
+        return K @ np.column_stack([self.R[:, 0], self.R[:, 1], t])
+
+    def project_ideal3d(self, pts: np.ndarray) -> np.ndarray:
+        """3D points (X, Y, Z down) -> ideal (undistorted) pixels."""
+        P = (np.asarray(pts, np.float64).reshape(-1, 3) - self.C) @ self.R.T
+        return np.column_stack([self.f_px * P[:, 0] / P[:, 2] + self.width / 2,
+                                self.f_px * P[:, 1] / P[:, 2] + self.height / 2])
+
     def project(self, pts_mat: np.ndarray) -> np.ndarray:
-        """Mat mm -> distorted image pixels."""
-        ideal = apply_h(self.H, pts_mat)
+        """Mat mm (Nx2, on the reference plane) or 3D points (Nx3) -> distorted image pixels."""
+        pts_mat = np.asarray(pts_mat, dtype=np.float64)
+        if pts_mat.ndim == 2 and pts_mat.shape[1] == 3:
+            ideal = self.project_ideal3d(pts_mat)
+        else:
+            ideal = apply_h(self.H, pts_mat)
         cx, cy, f = self.width / 2, self.height / 2, self.f_px
         x = (ideal[:, 0] - cx) / f
         y = (ideal[:, 1] - cy) / f
         r2 = x * x + y * y
         d = 1 + self.k1 * r2
         return np.column_stack([x * d * f + cx, y * d * f + cy])
+
+    def undistort_grid(self, rows: slice) -> tuple[np.ndarray, np.ndarray]:
+        """Distorted pixel grid rows -> ideal (undistorted) pixel coords (float64)."""
+        cx, cy, f = self.width / 2, self.height / 2, self.f_px
+        v = np.arange(rows.start, rows.stop, dtype=np.float64)[:, None]
+        u = np.arange(self.width, dtype=np.float64)[None, :]
+        xd = np.broadcast_to((u - cx) / f, (len(v), self.width))
+        yd = np.broadcast_to((v - cy) / f, (len(v), self.width))
+        xu, yu = xd.copy(), yd.copy()
+        if self.k1 != 0.0:
+            for _ in range(6):
+                d = 1 + self.k1 * (xu * xu + yu * yu)
+                xu = xd / d
+                yu = yd / d
+        return xu * f + cx, yu * f + cy
 
     def unproject_grid(self, rows: slice) -> tuple[np.ndarray, np.ndarray]:
         """Distorted pixel grid rows -> mat mm (float64)."""
@@ -358,15 +390,22 @@ def scene_bounds(cam: Camera, margin_mm: float = 15.0) -> tuple[float, float, fl
     return min(X) - margin_mm, min(Y) - margin_mm, max(X) + margin_mm, max(Y) + margin_mm
 
 
-def photograph(scene: Scene, cam: Camera, look: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
+def photograph(scene: Scene | None, cam: Camera, look: dict[str, Any], rng: np.random.Generator,
+               ideal: np.ndarray | None = None) -> np.ndarray:
     """Project the scene through the camera and apply the photometric model.
 
-    ``look`` holds already-sampled parameters (see sample_look in gen.py)."""
+    Flat mode passes the mat ``scene``; rack mode passes ``ideal``, an already
+    perspective-rendered undistorted image, and only lens distortion is applied
+    geometrically. ``look`` holds already-sampled parameters."""
     s = SCENE_PX_PER_MM
-    ppm = cam.f_px / abs(cam.C[2])
-    # anti-alias the scene for the ~0.8x downsample
-    sigma_aa = max(0.0, 0.5 * (s / ppm) - 0.35)
-    src = cv2.GaussianBlur(scene.img, (0, 0), sigma_aa) if sigma_aa > 0.05 else scene.img
+    if ideal is not None:
+        src = ideal
+    else:
+        assert scene is not None
+        ppm = cam.f_px / abs(cam.C[2])
+        # anti-alias the scene for the ~0.8x downsample
+        sigma_aa = max(0.0, 0.5 * (s / ppm) - 0.35)
+        src = cv2.GaussianBlur(scene.img, (0, 0), sigma_aa) if sigma_aa > 0.05 else scene.img
     W, H = cam.width, cam.height
     out = np.empty((H, W, 3), np.uint8)
 
@@ -379,9 +418,13 @@ def photograph(scene: Scene, cam: Camera, look: dict[str, Any], rng: np.random.G
     step = 256
     for r0 in range(0, H, step):
         rows = slice(r0, min(H, r0 + step))
-        X, Y = cam.unproject_grid(rows)
-        mx = ((X - scene.x0) * s).astype(np.float32)
-        my = ((Y - scene.y0) * s).astype(np.float32)
+        if ideal is not None:
+            px, py = cam.undistort_grid(rows)
+            mx, my = px.astype(np.float32), py.astype(np.float32)
+        else:
+            X, Y = cam.unproject_grid(rows)
+            mx = ((X - scene.x0) * s).astype(np.float32)
+            my = ((Y - scene.y0) * s).astype(np.float32)
         chunk = cv2.remap(src, mx, my, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         vv = ((np.arange(rows.start, rows.stop, dtype=np.float32) - H / 2) / (H / 2))[:, None]
         r2 = (uu[None, :] ** 2 * (W / H) ** 2 + vv ** 2) / (1 + (W / H) ** 2) * 2  # ~1 at the corners
