@@ -22,8 +22,8 @@ The same library runs in a desktop CLI (for evaluation) and in an Android app.
  │    │                   find the name line (+ drift tracking down the      │
  │    │                   column), cut off the mana cost                     │
  │    ▼                                                                      │
- │  ocr.rs   trait Recognizer; RtenRecognizer = PP-OCRv5 rec ONNX on `rten`  │
- │    │      + CTC greedy decode         (pass 2: fallback crops for misses) │
+ │  ocr.rs   trait Recognizer; RtenRecognizer = PP-OCR rec ONNX on `rten`     │
+ │    │      fast model first, PP-OCRv5 for doubtful slots, fallback crops   │
  │    ▼                                                                      │
  │  matching.rs  SPEC §3 clean/normalize, bit-parallel Indel ratio,          │
  │    │          per-oracle best, accept rule                                │
@@ -32,7 +32,7 @@ The same library runs in a desktop CLI (for evaluation) and in an Android app.
  └──────────────────────────────────────────────────────────────────────────┘
  cli/      crate fscan-cli -> binary `fscan scan --out <dir> <image>...`
  android/  crate fscan-android -> libfscan_android.so (NativeActivity + egui)
- models/   en_PP-OCRv5_rec_mobile.onnx + .dict.txt (Apache-2.0)
+ models/   en_PP-OCRv5_rec_mobile.onnx (accurate) + PP-OCRv6_rec_tiny.onnx (fast), + .dict.txt (Apache-2.0)
 ```
 
 ## Build, test, run
@@ -46,7 +46,10 @@ cd rust
 cargo test                       # unit tests + SPEC §3 vectors (testdata/names/match_cases.json)
 cargo build --release -p fscan-cli
 ./target/release/fscan scan --out results/smoke ../testdata/smoke/*.jpg
-# options: --names <names_v1.json[.gz]> --model <rec.onnx> --dump-crops <dir>
+# options: --names <names_v1.json[.gz]> --model <rec.onnx> --fast-model <rec.onnx> | --no-fast
+#          --dump-crops <dir> --ocr-batch N --intra-op
+./target/release/fscan bench --reps 3 ../testdata/smoke/*.jpg   # per-stage timing table
+bash scripts/gate.sh <label> [binary] [sets...]                 # accuracy gate via tools/eval.py
 cd .. && uv run --project tools tools/eval.py --manifest testdata/smoke/manifest.json --results rust/results/smoke
 ```
 
@@ -123,21 +126,37 @@ external files dir and prints config/status/columns/slots/auto/timing.
   autos). Each column is now walked top-down and every slot's text search is
   centred on the drift predicted (robust line fit) from the name lines found
   above it. Slot numbering is untouched.
-- **Two passes**: all primary crops are read first; only slots that did not
-  auto-accept are re-read from fallbacks (inverted crop, second-best text
-  line, untrimmed line) and the best match wins.
-- **Stricter-only guards** (never loosen SPEC §3): a reading with < 3
-  letters/digits is never auto (fragments like `X` matched the card "X"); a
-  trailing mana-cost token read as letters (`Dig Through Time 6UU`) is also
-  tried stripped.
+- **Reader cascade (Phase 2)**: the small PP-OCRv6 *tiny* model (1.1M
+  parameters, ~3.6x cheaper) reads every slot; its auto-accepts are trusted
+  when the score is >= 95 or the text looks like a title-case name bar.
+  PP-OCRv5 re-reads everything else, and an untrusted fast-model auto
+  survives only if PP-OCRv5 also auto-accepts. `--no-fast` turns this off.
+- **Fallback round**: slots still not accepted are re-read once more from
+  fallback crops (untrimmed line if the trim cut something, second-best text
+  line, inverted crop) in one parallel OCR call; the best match wins.
+- **Stricter-only guards** (never loosen SPEC §3; they only turn autos into
+  reviews): a reading with < 3 letters/digits (fragments like `X` matched the
+  card "X"); an all-caps reading with < 5 letters or whose best match is a
+  known frame decoy ("THE PROSPERITY POST" masthead -> "Prosperity"); two best
+  names equal up to spaces ("Wasteland" / "Waste Land"). A trailing mana-cost
+  token read as letters (`Dig Through Time 6UU`) is also tried stripped.
 - **Matching**: Indel ratio via bit-parallel LCS (Hyyrö), exact rational
-  tie-breaks; ~1 ms per query over 62,659 keys. Scores are rounded like the
-  reference (float32, 4 decimals) so boundary cases agree.
+  tie-breaks, keys stored flat and grouped by oracle; ~3-7 ms per query over
+  62,659 keys on this laptop. Scores are rounded like the reference
+  (float32, 4 decimals) so boundary cases agree.
 
 ## Results
 
-Scored with `tools/eval.py` (2026-10-05, code at commit `d850406` + README;
-model `en_PP-OCRv5_rec_mobile`). "auto" = auto-accepted *and* correct over
+**Phase 2 (current code, 2026-10-06, commit `b5e7b2d`):** smoke 96.99% /
+dev 95.78% / large 95.89% auto, wrong 0 / 0 / 1 (the 1 is a test-label
+error, see PERF.md), 0 column-count and 0 status errors; **3.9 s per C4
+photo** on this laptop (Phase 1: 8.1 s); 4.8 s/photo mean on dev, 4.4 s on
+large. Full tables, per-stage profile and the phone estimate are in
+[`PERF.md`](PERF.md).
+
+Phase 1 results (kept for reference) were scored with `tools/eval.py`
+(2026-10-05, code at commit `d850406` + README; model
+`en_PP-OCRv5_rec_mobile`). "auto" = auto-accepted *and* correct over
 scored slots (excludes `lang: other` and sideways split cards, per eval).
 
 | set | images | slots | auto rate | wrong | review / empty | column-count errors | status errors |
@@ -150,7 +169,7 @@ Portuguese 97.9%, "special" frames 82.7% (showcase / Universes Beyond cards
 whose name bar shows a flavour name or a newspaper masthead — these correctly
 go to review). By difficulty: easy 96.5%, normal 96.2%, hard 94.2%.
 
-### Speed (release build, this laptop's 4-core CPU, one photo at a time)
+### Phase 1 speed (release build, this laptop's 4-core CPU, one photo at a time)
 
 | | per photo | of which OCR |
 | --- | --- | --- |
@@ -166,9 +185,9 @@ Phase 2 ideas below).
 
 ### Known failure modes / next steps
 
-- OCR time dominates. Options: crop width is already trimmed to the name;
-  next would be int8 quantisation, rten tuning for depthwise convs, an
-  `ort` backend on desktop, or batching all columns.
+- OCR time still dominates (~89% of wall time). Phase 2 tried int8
+  quantisation (accuracy collapses), parallel batch scheduling (kept), a
+  smaller first-pass model (kept); see PERF.md for the rest.
 - Reviews are mostly cards whose name bar doesn't hold the oracle name
   (special frames, flavour names, sideways splits/battles, `lang: other`)
   plus blur on hard images (`Toraga Treesneaker`).
